@@ -1,0 +1,6 @@
+[cog]
+name = "http-signatures"
+version = "0.1.0"
+module = "HTTPSignatures"
+documentation = "https://http-signatures.api.quarz.dev"
+repository = "https://github.com/quarz-lang/http-signatures"

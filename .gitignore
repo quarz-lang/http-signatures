@@ -1,0 +1,4 @@
+/.quarz/
+/doc/
+# This machine's [patch] of a dependency (docs/10 §2).
+/Cog.local.toml

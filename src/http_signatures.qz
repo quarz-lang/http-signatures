@@ -1,0 +1,8 @@
+# HTTP Signatures: signing and verifying HTTP requests with the
+# `Signature` header of draft-cavage-http-signatures-12, and the
+# `Digest` header (RFC 3230) of the body it covers.
+#
+# Work in progress: the design is issue #1.
+
+# The version of the cog.
+VERSION = "0.1.0"
