@@ -74,6 +74,10 @@ class SignTest < Test::Case
       HTTPSignatures.sign(req, key_id: "Test", key: key, algorithm: "hs2019", headers: ["(expires)"])
       nil
     end
+    assert_raise_message("sign: no headers are covered") do
+      HTTPSignatures.sign(req, key_id: "Test", key: key, headers: [])
+      nil
+    end
     assert_raise_message("sign: the request has no x-absent header") do
       HTTPSignatures.sign(req, key_id: "Test", key: key, headers: ["x-absent"])
       nil
@@ -123,7 +127,7 @@ class SignRoundTripTest < Test::Case
     serving(pub) do |base|
       c = HTTP::Client.new
       cases = [
-        HTTP::Client::Request.post("#{base}/inbox?a=1&b=%20", body: "{\"x\": 1}", content_type: "application/json"),
+        HTTP::Client::Request.post("#{base}/orders?a=1&b=%20", body: "{\"x\": 1}", content_type: "application/json"),
         HTTP::Client::Request.post("#{base}/bytes", body: Bytes.from([0, 255, 10])),
         HTTP::Client::Request.get("#{base}/"),
         HTTP::Client::Request.get("#{base}", {"Host" => "spoofed.example"}),
@@ -138,7 +142,7 @@ class SignRoundTripTest < Test::Case
                                headers: ["(request-target)", "(created)", "host", "date", "digest"])
       assert_equal("key-2 hs2019 (request-target) (created) host date digest 8", c.request(hs).body.read)
       # Changed after signing: refused.
-      tampered = HTTPSignatures.sign(cases[0], key_id: "key-1", key: key).with(url: "#{base}/inbox?a=2&b=%20")
+      tampered = HTTPSignatures.sign(cases[0], key_id: "key-1", key: key).with(url: "#{base}/orders?a=2&b=%20")
       res = c.request(tampered)
       assert_equal(401, res.status)
       assert_equal("HTTPSignatures::BadSignature: the signature does not verify with the key", res.body.read)

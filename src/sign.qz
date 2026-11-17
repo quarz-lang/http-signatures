@@ -21,17 +21,17 @@ require "base64"
 #
 # ```quarz no_run
 # key = Crypto::RSA::PrivateKey.from_pem(File.read("private.pem"))
-# req = HTTP::Client::Request.post("https://example.com/inbox", body: "{}", content_type: "application/json")
-# signed = HTTPSignatures.sign(req, key_id: "https://example.com/actor#main-key", key: key)
+# req = HTTP::Client::Request.post("https://example.com/orders", body: "{}", content_type: "application/json")
+# signed = HTTPSignatures.sign(req, key_id: "client-1", key: key)
 # HTTP::Client.default.request(signed)
 # ```
 #
 # ## Raises
 #
-# `ArgumentError` for another algorithm, a covered header the request
-# does not have, a covered name that is no header name, `(created)` or
-# `(expires)` with rsa-sha256, `(expires)` without `expires`, or a
-# `digest` to compute for a streamed body.
+# `ArgumentError` for another algorithm, an empty `headers`, a covered
+# header the request does not have, a covered name that is no header
+# name, `(created)` or `(expires)` with rsa-sha256, `(expires)` without
+# `expires`, or a `digest` to compute for a streamed body.
 public def sign(request: HTTP::Client::Request, *, key_id: String, key: Crypto::RSA::PrivateKey,
                 headers: Array[String] = ["(request-target)", "host", "date", "digest"],
                 algorithm: String = "rsa-sha256", hs2019_pss: Bool = false, created: Time? = nil,

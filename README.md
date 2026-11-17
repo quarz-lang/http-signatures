@@ -13,8 +13,70 @@ HTTPSignatures = { git = "https://github.com/quarz-lang/http-signatures", tag = 
 ```
 
 The API reference of the main branch is at <https://http-signatures.api.quarz.dev>.
+The design and its decisions are in issue #1.
 
-Work in progress: the design is issue #1. Nothing is released yet.
+## Signing a request
+
+```crystal
+key = Crypto::RSA::PrivateKey.from_pem(File.read("private.pem"))
+req = HTTP::Client::Request.post("https://example.com/orders", body: json, content_type: "application/json")
+signed = HTTPSignatures.sign(req, key_id: "client-1", key: key)
+HTTP::Client.default.request(signed)
+```
+
+`sign` gives a copy of the request with a `Signature` header. By default
+it covers `(request-target) host date digest`, adding `Date` and
+`Digest` when the request has none; `(request-target)` and `host` are
+what the client sends (`HTTP::Client::Request#target`, `#host`).
+`algorithm:` is `"rsa-sha256"` (the default) or `"hs2019"`.
+`created:`/`expires:` write those parameters whenever they are given;
+covering `(created)` or `(expires)` needs hs2019.
+
+## Verifying a request
+
+```crystal
+handler = HTTP.handler do |req|
+  begin
+    v = HTTPSignatures.verify(req) { |key_id| key_for(key_id) }   # a Crypto::RSA::PublicKey or nil
+    HTTP::Server::Response.text("hello #{v.key_id}")              # v.body: the body, read and checked
+  rescue HTTPSignatures::Error => e
+    HTTP::Server::Response.text(e.message, 401)
+  end
+end
+```
+
+`verify` checks, in order: the parameters (from `Signature`, or
+`Authorization: Signature`), the algorithm, the covered names, that
+`required:` names (by default `(request-target) host date`) are covered,
+the time (`Date`, `created`, `expires` within `max_skew:`, five minutes),
+the signature with the key the block gives, and then the body against
+the covered `Digest` (a body no `Digest` covers is refused unless
+`require_digest: false`). Each failure raises a subclass of
+`HTTPSignatures::Error` whose message says why and quotes nothing the
+peer sent.
+
+The block is given the peer's `keyId` before anything is verified: a
+block that fetches a key by it must check it first (a URL to fetch is a
+request the peer chose).
+
+## What is supported
+
+- Keys: RSA (`Crypto::RSA`). `rsa-sha256` is RSASSA-PKCS1-v1_5 with
+  SHA-256; `hs2019` is that, or RSASSA-PSS with SHA-512 (verifying
+  accepts either; signing writes the first unless `hs2019_pss: true`).
+  A signature naming no algorithm is verified as `hs2019`.
+- `(request-target)`, `(created)`, `(expires)` and any header; repeated
+  headers joined by `, `; at most 32 covered names. Without a `headers`
+  parameter, `date` is covered for `rsa-sha256` and `(created)` for
+  `hs2019`.
+- `Digest` with `SHA-256` (the name in any case, among other entries).
+- The draft's Appendix C test vectors, checked byte for byte.
+
+Not supported: HMAC, ECDSA and Ed25519 keys; `rsa-sha1`; `(created)` or
+`(expires)` with `rsa-sha256` (the draft forbids them there); other
+`Digest` algorithms and RFC 9530's `Content-Digest`; RFC 9421 (HTTP
+Message Signatures), the draft's standard successor; signing a streamed
+body's `Digest`; signing responses.
 
 ## License
 
