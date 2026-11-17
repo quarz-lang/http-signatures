@@ -1,0 +1,88 @@
+require "http"
+require "crypto"
+require "base64"
+
+# `request` signed with HTTP Signatures (draft-cavage-http-signatures-12):
+# a copy with a Signature header over the covered names, and the headers
+# the signature needs added.
+#
+# - The Date header is set to `now` (an HTTP date) when `date` is covered
+#   and the request has none;
+# - the Digest header is set to the body's SHA-256 (`SHA-256=…`) when
+#   `digest` is covered and the request has none;
+# - `(request-target)` and `host` are what the client sends:
+#   `HTTP::Client::Request#target` and `HTTP::Client::Request#host`.
+#
+# `algorithm` is `"rsa-sha256"` (RSASSA-PKCS1-v1_5 with SHA-256, what
+# most verifiers accept) or `"hs2019"`, which signs the same way unless
+# `hs2019_pss` (RSASSA-PSS with SHA-512). `created` and `expires` are
+# written when given; with hs2019, `(created)` covered without `created`
+# takes `now`.
+#
+# ```quarz no_run
+# key = Crypto::RSA::PrivateKey.from_pem(File.read("private.pem"))
+# req = HTTP::Client::Request.post("https://example.com/inbox", body: "{}", content_type: "application/json")
+# signed = HTTPSignatures.sign(req, key_id: "https://example.com/actor#main-key", key: key)
+# HTTP::Client.default.request(signed)
+# ```
+#
+# ## Raises
+#
+# `ArgumentError` for another algorithm, a covered header the request
+# does not have, a covered name that is no header name, `(created)` or
+# `(expires)` with rsa-sha256, `(expires)` without `expires`, or a
+# `digest` to compute for a streamed body.
+public def sign(request: HTTP::Client::Request, *, key_id: String, key: Crypto::RSA::PrivateKey,
+                headers: Array[String] = ["(request-target)", "host", "date", "digest"],
+                algorithm: String = "rsa-sha256", hs2019_pss: Bool = false, created: Time? = nil,
+                expires: Time? = nil, now: Time = Time.now) -> HTTP::Client::Request
+  alg = algorithm.downcase
+  raise ArgumentError, "sign: algorithm is rsa-sha256 or hs2019, not #{algorithm.inspect}" unless alg == "rsa-sha256" || alg == "hs2019"
+  covered = headers.map { |n| n.downcase }
+  if alg == "rsa-sha256" && (covered.include?("(created)") || covered.include?("(expires)"))
+    raise ArgumentError, "sign: rsa-sha256 does not allow (created) or (expires)"
+  end
+  created_at = created || (covered.include?("(created)") ? now : nil)
+  raise ArgumentError, "sign: (expires) is covered but expires is not given" if covered.include?("(expires)") && expires.nil?
+  sent = request.headers
+  sent = sent.put("date", now.httpdate) if covered.include?("date") && !sent.key?("date")
+  if covered.include?("digest") && !sent.key?("digest")
+    body = case request.body
+           in HTTP::Content::Empty then Bytes.new
+           in HTTP::Content::Text(text:) then text.to_bytes
+           in HTTP::Content::Binary(bytes:) then bytes
+           in HTTP::Content::Stream then raise(ArgumentError, "sign: a streamed body has no Digest to compute")
+           end
+    sent = sent.put("digest", Digest.header(body))
+  end
+  created_text = created_at ? created_at.to_i.to_s : nil
+  expires_text = expires ? expires.to_i.to_s : nil
+  text = begin
+    signing_string(request.method, request.target, sent.put("host", request.host), covered,
+                   created: created_text, expires: expires_text)
+  rescue Error => e
+    raise ArgumentError, "sign: #{e.message}"
+  end
+  signature = alg == "hs2019" && hs2019_pss ? key.sign_pss(text, :sha512) : key.sign(text, :sha256)
+  params = ["keyId=#{Sign.quoted(key_id)}", "algorithm=\"#{alg}\""]
+  params = params.push("created=#{created_text}") if created_text
+  params = params.push("expires=#{expires_text}") if expires_text
+  params = params.push("headers=\"#{covered.join(" ")}\"")
+  params = params.push("signature=\"#{Base64.encode(signature)}\"")
+  request.with(headers: sent.put("signature", params.join(",")))
+end
+
+# :nodoc:
+module Sign
+  # `text` as a quoted string: `"` and `\` escaped.
+  def self.quoted(text: String) -> String
+    out = String::Builder.new
+    out << "\""
+    text.each_char do |c|
+      out << "\\" if c == "\"" || c == "\\"
+      out << c
+    end
+    out << "\""
+    out.to_s
+  end
+end
