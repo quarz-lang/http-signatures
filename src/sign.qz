@@ -21,8 +21,8 @@ require "base64"
 #
 # ```quarz no_run
 # key = Crypto::RSA::PrivateKey.from_pem(File.read("private.pem"))
-# req = HTTP::Client::Request.post("https://example.com/inbox", body: "{}", content_type: "application/json")
-# signed = HTTPSignatures.sign(req, key_id: "https://example.com/actor#main-key", key: key)
+# req = HTTP::Client::Request.post("https://example.com/orders", body: "{}", content_type: "application/json")
+# signed = HTTPSignatures.sign(req, key_id: "client-1", key: key)
 # HTTP::Client.default.request(signed)
 # ```
 #

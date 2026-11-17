@@ -19,8 +19,8 @@ The design and its decisions are in issue #1.
 
 ```crystal
 key = Crypto::RSA::PrivateKey.from_pem(File.read("private.pem"))
-req = HTTP::Client::Request.post("https://example.com/inbox", body: json, content_type: "application/json")
-signed = HTTPSignatures.sign(req, key_id: "https://example.com/actor#main-key", key: key)
+req = HTTP::Client::Request.post("https://example.com/orders", body: json, content_type: "application/json")
+signed = HTTPSignatures.sign(req, key_id: "client-1", key: key)
 HTTP::Client.default.request(signed)
 ```
 
@@ -28,8 +28,9 @@ HTTP::Client.default.request(signed)
 it covers `(request-target) host date digest`, adding `Date` and
 `Digest` when the request has none; `(request-target)` and `host` are
 what the client sends (`HTTP::Client::Request#target`, `#host`).
-`algorithm:` is `"rsa-sha256"` (the default) or `"hs2019"`;
-`created:`/`expires:` add those parameters (with hs2019).
+`algorithm:` is `"rsa-sha256"` (the default) or `"hs2019"`.
+`created:`/`expires:` write those parameters whenever they are given;
+covering `(created)` or `(expires)` needs hs2019.
 
 ## Verifying a request
 

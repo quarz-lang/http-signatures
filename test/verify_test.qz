@@ -108,11 +108,11 @@ class VerifyTest < Test::Case
     text = HTTPSignatures.signing_string("POST", TARGET, h, covered)
     sig = Base64.encode(key.sign(text, :sha256))
     header = "signature=\"#{sig}\", headers=\"(request-target) host date digest\", algorithm=\"RSA-SHA256\", " +
-             "keyId=\"https://example.com/actor#main-key\", foo=\"bar\""
+             "keyId=\"https://example.com/keys/client-1#rsa\", foo=\"bar\""
     v = HTTPSignatures.verify(request(h.add("Signature", header)), now: now) do |id|
-      id == "https://example.com/actor#main-key" ? public_key : nil
+      id == "https://example.com/keys/client-1#rsa" ? public_key : nil
     end
-    assert_equal("https://example.com/actor#main-key", v.key_id)
+    assert_equal("https://example.com/keys/client-1#rsa", v.key_id)
   end
 
   def test_multi_valued_headers
