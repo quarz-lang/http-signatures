@@ -1,0 +1,53 @@
+require "test"
+
+class DigestTest < Test::Case
+  BODY = "{\"hello\": \"world\"}"
+  # The draft's Appendix C request's Digest.
+  VALUE = "X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE="
+
+  def test_header
+    assert_equal("SHA-256=#{VALUE}", HTTPSignatures::Digest.header(BODY))
+    assert_equal("SHA-256=#{VALUE}", HTTPSignatures::Digest.header(BODY.to_bytes))
+    assert_equal("SHA-256=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=", HTTPSignatures::Digest.header(""))
+  end
+
+  def test_matches
+    assert(HTTPSignatures::Digest.matches?("SHA-256=#{VALUE}", BODY))
+    # The algorithm's name in any case; spaces around entries.
+    assert(HTTPSignatures::Digest.matches?("sha-256=#{VALUE}", BODY))
+    assert(HTTPSignatures::Digest.matches?(" Sha-256 = #{VALUE} ", BODY))
+    # Among others in a list.
+    assert(HTTPSignatures::Digest.matches?("MD5=Sd/dVLAcvNLSq16eXua5uQ==, SHA-256=#{VALUE}", BODY))
+  end
+
+  def test_does_not_match
+    assert(!HTTPSignatures::Digest.matches?("SHA-256=#{VALUE}", BODY + " "))
+    assert(!HTTPSignatures::Digest.matches?("SHA-512=#{VALUE}", BODY))
+    assert(!HTTPSignatures::Digest.matches?("SHA-256", BODY))
+    assert(!HTTPSignatures::Digest.matches?("SHA-256=not base64!", BODY))
+    assert(!HTTPSignatures::Digest.matches?("", BODY))
+  end
+
+  # A value of another length never matches (`Crypto.secure_compare` is
+  # false for unequal lengths).
+  def test_another_length
+    full = ::Digest::SHA256.digest(BODY)
+    short = full.slice(0, 31)
+    long = Bytes.from(full.to_a + [0])
+    assert(!HTTPSignatures::Digest.matches?("SHA-256=#{Base64.encode(short)}", BODY))
+    assert(!HTTPSignatures::Digest.matches?("SHA-256=#{Base64.encode(long)}", BODY))
+  end
+
+  # The first SHA-256 entry decides, a valid later one included.
+  def test_the_first_entry_decides
+    good = "SHA-256=#{VALUE}"
+    assert(!HTTPSignatures::Digest.matches?("SHA-256=AAAA, #{good}", BODY))
+    assert(!HTTPSignatures::Digest.matches?("SHA-256=not base64!, #{good}", BODY))
+    assert(HTTPSignatures::Digest.matches?("#{good}, SHA-256=AAAA", BODY))
+  end
+
+  def test_sha256
+    assert_equal(::Digest::SHA256.digest(BODY), HTTPSignatures::Digest.sha256("SHA-256=#{VALUE}"))
+    assert_nil(HTTPSignatures::Digest.sha256("MD5=Sd/dVLAcvNLSq16eXua5uQ=="))
+  end
+end

@@ -1,0 +1,67 @@
+require "test"
+require "http"
+
+class SigningStringTest < Test::Case
+  # The draft's example in §2.3, its folded X-Example as one line (a
+  # server refuses folded headers).
+  def test_the_drafts_example
+    headers = HTTP::Headers.empty
+                .add("Host", "example.org")
+                .add("Date", "Tue, 07 Jun 2014 20:51:35 GMT")
+                .add("X-Example", "Example header with some whitespace.")
+                .add("X-EmptyHeader", "")
+                .add("Cache-Control", "max-age=60")
+                .add("Cache-Control", "must-revalidate")
+    covered = "(request-target) (created) host date cache-control x-emptyheader x-example".split(" ")
+    assert_equal(["(request-target): get /foo",
+                  "(created): 1402170695",
+                  "host: example.org",
+                  "date: Tue, 07 Jun 2014 20:51:35 GMT",
+                  "cache-control: max-age=60, must-revalidate",
+                  "x-emptyheader: ",
+                  "x-example: Example header with some whitespace."].join("\n"),
+                 HTTPSignatures.signing_string("GET", "/foo", headers, covered, created: "1402170695"))
+  end
+
+  def test_names_and_values
+    headers = HTTP::Headers.empty.add("X-A", " \tspaced\t ").add("x-a", "two")
+    assert_equal("x-a: spaced, two", HTTPSignatures.signing_string("GET", "/", headers, ["X-A"]))
+    assert_equal("(request-target): delete /a?b=1\n(expires): 1402170699.5",
+                 HTTPSignatures.signing_string("DELETE", "/a?b=1", headers, ["(Request-Target)", "(expires)"],
+                                               expires: "1402170699.5"))
+  end
+
+  def test_errors
+    headers = HTTP::Headers.of({"Host" => "example.com"})
+    e = assert_raise(HTTPSignatures::MissingHeader) { HTTPSignatures.signing_string("GET", "/", headers, ["host", "date"]); nil }
+    assert_equal("the request has no date header", e.message)
+    assert_raise(HTTPSignatures::MalformedSignature) { HTTPSignatures.signing_string("GET", "/", headers, []); nil }
+    assert_raise_message("(created) is covered but created is not given") do
+      HTTPSignatures.signing_string("GET", "/", headers, ["(created)"])
+      nil
+    end
+    assert_raise_message("(expires) is covered but expires is not given") do
+      HTTPSignatures.signing_string("GET", "/", headers, ["(expires)"])
+      nil
+    end
+    assert(e.is_a?(HTTPSignatures::Error))
+  end
+
+  # A covered name that is no header name is refused by its position,
+  # never quoted (it may come from a peer).
+  def test_names_that_are_no_header_names
+    headers = HTTP::Headers.of({"Host" => "example.com"})
+    ["x y", "x\u0001y", "x:y", "(other)", "", "\u00e9", "#{"a" * 1_000_000} b"].each do |bad|
+      e = assert_raise(HTTPSignatures::MalformedSignature) do
+        HTTPSignatures.signing_string("GET", "/", headers, ["host", bad])
+        nil
+      end
+      assert_equal("covered name 2 is not a header name", e.message)
+    end
+    # Token characters are header names; the pseudo-names in any case.
+    assert_raise(HTTPSignatures::MissingHeader) do
+      HTTPSignatures.signing_string("GET", "/", headers, ["(REQUEST-TARGET)", "x!#$%&'*+-.^_`|~9"])
+      nil
+    end
+  end
+end
