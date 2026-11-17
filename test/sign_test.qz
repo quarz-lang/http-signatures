@@ -74,6 +74,10 @@ class SignTest < Test::Case
       HTTPSignatures.sign(req, key_id: "Test", key: key, algorithm: "hs2019", headers: ["(expires)"])
       nil
     end
+    assert_raise_message("sign: no headers are covered") do
+      HTTPSignatures.sign(req, key_id: "Test", key: key, headers: [])
+      nil
+    end
     assert_raise_message("sign: the request has no x-absent header") do
       HTTPSignatures.sign(req, key_id: "Test", key: key, headers: ["x-absent"])
       nil

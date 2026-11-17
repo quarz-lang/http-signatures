@@ -28,10 +28,10 @@ require "base64"
 #
 # ## Raises
 #
-# `ArgumentError` for another algorithm, a covered header the request
-# does not have, a covered name that is no header name, `(created)` or
-# `(expires)` with rsa-sha256, `(expires)` without `expires`, or a
-# `digest` to compute for a streamed body.
+# `ArgumentError` for another algorithm, an empty `headers`, a covered
+# header the request does not have, a covered name that is no header
+# name, `(created)` or `(expires)` with rsa-sha256, `(expires)` without
+# `expires`, or a `digest` to compute for a streamed body.
 public def sign(request: HTTP::Client::Request, *, key_id: String, key: Crypto::RSA::PrivateKey,
                 headers: Array[String] = ["(request-target)", "host", "date", "digest"],
                 algorithm: String = "rsa-sha256", hs2019_pss: Bool = false, created: Time? = nil,
