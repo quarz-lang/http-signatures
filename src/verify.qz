@@ -1,0 +1,246 @@
+require "http"
+require "crypto"
+require "base64"
+
+# What a verified request was signed with, and its body.
+data Verified(
+  # The signature's `keyId`, the key the block gave for it verified.
+  key_id: String,
+  # The signature's algorithm: `"rsa-sha256"` or `"hs2019"` (also when
+  # the signature names none).
+  algorithm: String,
+  # The names the signature covers, lowercased, in its order.
+  headers: Array[String],
+  # The request's body, read whole to check its Digest: use it, the
+  # request's body has been read.
+  body: Bytes
+)
+end
+
+# Verifies the HTTP Signature (draft-cavage-http-signatures-12) of
+# `request`, from its Signature header or, without one, its
+# Authorization header of the Signature scheme. The block gives the
+# public key of a `keyId`, or nil for none; it may wait (fetch a key).
+#
+# ```quarz no_run
+# keys: Hash[String, Crypto::RSA::PublicKey] = {}   # keyId => key
+# handler = HTTP.handler do |req|
+#   begin
+#     v = HTTPSignatures.verify(req) { |key_id| keys[key_id]? }
+#     HTTP::Server::Response.text("signed by #{v.key_id}: #{v.body.size} bytes")
+#   rescue HTTPSignatures::Error => e
+#     HTTP::Server::Response.text(e.message, 401)
+#   end
+# end
+# ```
+#
+# The block is given the peer's `keyId` before anything is verified (a
+# key is needed to verify): it is the peer's text. A block that fetches
+# a key by it must check it first: a URL to fetch is a request the peer
+# chose (restrict its scheme and host, and use a client made with
+# `allow_address: HTTP::Client.public_only`).
+#
+# What is checked:
+#
+# - the parameters: `keyId` and `signature` given, none twice, unknown
+#   ones ignored; `algorithm` is `rsa-sha256` or `hs2019`, and a
+#   signature naming none counts as `hs2019`. Every key is RSA:
+#   `rsa-sha256` is RSASSA-PKCS1-v1_5 with SHA-256, and `hs2019` is that
+#   or RSASSA-PSS with SHA-512;
+# - the covered names: `headers`, or by default `date` for `rsa-sha256`
+#   and `(created)` for `hs2019`; at most 32, none twice, each in
+#   `required` among them. `(created)` and `(expires)` are refused with
+#   `rsa-sha256`;
+# - the time: a covered Date header (one only) within `max_skew` of
+#   `now`; `created` within `max_skew` of `now` (no older when a covered
+#   `expires` has not passed: the signer's window then governs);
+#   `expires` no earlier than `now - max_skew`. A `required` without
+#   `date` leaves freshness to `(created)` and `(expires)`;
+# - the signature of the signing string (`HTTPSignatures.signing_string`)
+#   with the key;
+# - the body, only once the signature has verified: read whole (`HTTP::Body#read_bytes(max: max_body_bytes)`, the
+#   server's limit at most) and, when it is not empty or a Digest header
+#   is covered, compared with that Digest (`require_digest: false`
+#   accepts a body no Digest covers).
+#
+# ## Raises
+#
+# An `HTTPSignatures::Error` saying why: `MissingSignature`,
+# `MalformedSignature`, `UnsupportedAlgorithm`, `MissingHeader`,
+# `Expired`, `UnknownKey`, `BadSignature` or `DigestMismatch`. Reading the
+# body raises as `HTTP::Body#read_bytes` does (`HTTP::PayloadTooLarge` past the
+# limit).
+public def verify(request: HTTP::Server::Request, *, required: Array[String] = ["(request-target)", "host", "date"],
+                  max_skew: Duration = 5.minutes, max_body_bytes: Int? = nil, require_digest: Bool = true,
+                  now: Time = Time.now, &key: (String) -> Crypto::RSA::PublicKey?) -> Verified
+  params = Verify.params(Verify.signature_text(request.headers))
+  key_id = params["keyid"]? || raise(MalformedSignature.new("the signature has no keyId"))
+  sig_text = params["signature"]? || raise(MalformedSignature.new("the signature has no signature parameter"))
+  algorithm = (params["algorithm"]? || "hs2019").downcase
+  unless algorithm == "rsa-sha256" || algorithm == "hs2019"
+    raise UnsupportedAlgorithm.new("the signature's algorithm is not rsa-sha256 or hs2019")
+  end
+  covered = Verify.covered(params["headers"]?, algorithm)
+  required.each do |name|
+    raise MissingHeader.new("the signature does not cover #{name.downcase}") unless covered.include?(name.downcase)
+  end
+  created = params["created"]?
+  expires = params["expires"]?
+  Verify.check_times(request.headers, covered, created, expires, max_skew, now)
+  text = signing_string(request.method, request.target, request.headers, covered, created: created, expires: expires)
+  signature = begin
+    Base64.decode(sig_text)
+  rescue ArgumentError
+    raise MalformedSignature.new("the signature parameter is not Base64")
+  end
+  public_key = yield(key_id)
+  raise UnknownKey.new("no key for the signature's keyId") if public_key.nil?
+  ok = Verify.signed?(public_key, text, signature, algorithm)
+  raise BadSignature.new("the signature does not verify with the key") unless ok
+  body = request.body.read_bytes(max: max_body_bytes)
+  if covered.include?("digest")
+    digest = request.headers.all("digest").join(", ")
+    raise DigestMismatch.new("the body does not match its Digest header") unless Digest.matches?(digest, body)
+  elsif require_digest && !body.empty?
+    raise DigestMismatch.new("the signature covers no Digest header for the body")
+  end
+  Verified.new(key_id: key_id, algorithm: algorithm, headers: covered, body: body)
+end
+
+# :nodoc:
+# The pieces of `verify`.
+module Verify
+  # At most this many covered names.
+  MAX_COVERED = 32
+
+  # Whether `signature` is the key's over `text`: RSASSA-PKCS1-v1_5 with
+  # SHA-256, or for hs2019 also RSASSA-PSS with SHA-512. A signature the
+  # key cannot check (of another length, PSS with too small a key) is
+  # one that does not verify.
+  def self.signed?(key: Crypto::RSA::PublicKey, text: String, signature: Bytes, algorithm: String) -> Bool
+    key.verify(text, signature, :sha256) || (algorithm == "hs2019" && key.verify_pss(text, signature, :sha512))
+  rescue Crypto::Error
+    false
+  end
+
+  # The parameters' text: the Signature header's, or the Authorization
+  # header's after its Signature scheme.
+  def self.signature_text(headers: HTTP::Headers) -> String
+    values = headers.all("signature")
+    raise MalformedSignature.new("the request has more than one Signature header") if values.size > 1
+    return values[0] if values.size == 1
+    auth = headers["authorization"]
+    if auth
+      scheme, _, rest = auth.strip.partition(" ")
+      return rest if scheme.downcase == "signature"
+    end
+    raise MissingSignature.new("the request has no Signature header")
+  end
+
+  # The parameters by lowercased name: `name="quoted"` or `name=bare`,
+  # separated by commas. A parameter given twice, or a list that does
+  # not parse, is malformed.
+  def self.params(text: String) -> Hash[String, String]
+    out: Hash[String, String] = {}
+    chars = text.chars
+    i = 0
+    loop do
+      i += 1 while i < chars.size && (chars[i] == " " || chars[i] == "\t")
+      break if i >= chars.size
+      start = i
+      i += 1 while i < chars.size && chars[i].match?(/[A-Za-z0-9_-]/)
+      name = chars[start...i].join.downcase
+      i += 1 while i < chars.size && (chars[i] == " " || chars[i] == "\t")
+      raise MalformedSignature.new("the signature's parameters do not parse") if name.empty? || i >= chars.size || chars[i] != "="
+      i += 1
+      i += 1 while i < chars.size && (chars[i] == " " || chars[i] == "\t")
+      value = String::Builder.new
+      if i < chars.size && chars[i] == "\""
+        i += 1
+        closed = false
+        while i < chars.size
+          c = chars[i]
+          if c == "\\" && i + 1 < chars.size
+            value << chars[i + 1]
+            i += 2
+          elsif c == "\""
+            closed = true
+            i += 1
+            break
+          else
+            value << c
+            i += 1
+          end
+        end
+        raise MalformedSignature.new("the signature's parameters do not parse") unless closed
+      else
+        while i < chars.size && chars[i] != "," && chars[i] != " " && chars[i] != "\t"
+          value << chars[i]
+          i += 1
+        end
+      end
+      raise MalformedSignature.new("the signature has a parameter twice") if out.key?(name)
+      out = out.put(name, value.to_s)
+      i += 1 while i < chars.size && (chars[i] == " " || chars[i] == "\t")
+      break if i >= chars.size
+      raise MalformedSignature.new("the signature's parameters do not parse") unless chars[i] == ","
+      i += 1
+    end
+    out
+  end
+
+  # The covered names, lowercased: the `headers` parameter's, or the
+  # algorithm's default.
+  def self.covered(headers: String?, algorithm: String) -> Array[String]
+    names = if headers.nil?
+              [algorithm == "rsa-sha256" ? "date" : "(created)"]
+            else
+              headers.split(/[ \t]+/).reject { |n| n.empty? }.map { |n| n.downcase }
+            end
+    raise MalformedSignature.new("the signature covers no headers") if names.empty?
+    raise MalformedSignature.new("the signature covers more than #{MAX_COVERED} headers") if names.size > MAX_COVERED
+    raise MalformedSignature.new("the signature covers a header twice") if names.uniq.size != names.size
+    if algorithm == "rsa-sha256" && (names.include?("(created)") || names.include?("(expires)"))
+      raise MalformedSignature.new("rsa-sha256 does not allow (created) or (expires)")
+    end
+    names
+  end
+
+  # Raises `Expired` (or `MalformedSignature` for a time that does not
+  # parse) unless the signature is valid at `now`.
+  def self.check_times(headers: HTTP::Headers, covered: Array[String], created: String?, expires: String?,
+                       max_skew: Duration, now: Time) -> Void
+    if covered.include?("date")
+      # (The Date that is checked is the one that is signed.)
+      dates = headers.all("date")
+      raise MalformedSignature.new("the request has more than one Date header") if dates.size > 1
+      text = dates[0]?
+      date = text ? Time.httpdate?(text) : nil
+      raise MalformedSignature.new("the Date header is not an HTTP date") if text && date.nil?
+      if date && (date - now > max_skew || now - date > max_skew)
+        raise Expired.new("the Date header is more than #{max_skew} from now")
+      end
+    end
+    # (At most 12 digits, 9 of fraction: no number that `Time.at` cannot
+    # take reaches it.)
+    if expires && !expires.match?(/\A[0-9]{1,12}(\.[0-9]{1,9})?\z/)
+      raise MalformedSignature.new("expires is not a number")
+    end
+    expires_at = expires ? Time.at(expires.to_f) : nil
+    if expires_at && now - expires_at > max_skew
+      raise Expired.new("the signature has expired")
+    end
+    if created
+      raise MalformedSignature.new("created is not an integer") unless created.match?(/\A[0-9]{1,12}\z/)
+      created_at = Time.at(created.to_i)
+      raise Expired.new("the signature was created in the future") if created_at - now > max_skew
+      # Older than the window: refused, unless a signed `expires` (which
+      # has not passed) sets the signer's own window. An `expires` the
+      # signature does not cover can only narrow, never widen.
+      if now - created_at > max_skew && !(expires_at && covered.include?("(expires)"))
+        raise Expired.new("the signature was created too long ago")
+      end
+    end
+    nil
+  end
+end

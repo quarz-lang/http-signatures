@@ -1,0 +1,309 @@
+require "test"
+require "http"
+require "crypto"
+require "base64"
+
+# HTTPSignatures.verify on server requests: the draft's Appendix C
+# requests as signed there, and requests signed here with its test key.
+class VerifyTest < Test::Case
+  BODY = "{\"hello\": \"world\"}"
+  DATE = "Sun, 05 Jan 2014 21:31:40 GMT"
+  TARGET = "/foo?param=value&pet=dog"
+
+  def key -> Crypto::RSA::PrivateKey = Crypto::RSA::PrivateKey.from_pem(File.read("test/fixtures/draft_test_key.pem"))
+  def public_key -> Crypto::RSA::PublicKey = Crypto::RSA::PublicKey.from_pem(File.read("test/fixtures/draft_test_key.pub.pem"))
+  def now -> Time = Time.httpdate(DATE)
+
+  # The Appendix C request's headers, with `extra` added.
+  def headers(extra: Hash[String, String] = {}) -> HTTP::Headers
+    h = HTTP::Headers.empty
+          .add("Host", "example.com")
+          .add("Date", DATE)
+          .add("Content-Type", "application/json")
+          .add("Digest", "SHA-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=")
+          .add("Content-Length", "18")
+    extra.each { |k, v| h = h.add(k, v) }
+    h
+  end
+
+  def request(h: HTTP::Headers, method: String = "POST", target: String = TARGET, body: String = BODY) -> HTTP::Server::Request
+    HTTP::Server::Request.build(method, target, h, body)
+  end
+
+  # The draft's key, for the key id "Test" only.
+  def lookup(id: String) -> Crypto::RSA::PublicKey? = id == "Test" ? public_key : nil
+
+  def run(req: HTTP::Server::Request, required: Array[String] = ["(request-target)", "host", "date"],
+          require_digest: Bool = true, at: Time = now) -> HTTPSignatures::Verified
+    HTTPSignatures.verify(req, required: required, require_digest: require_digest, now: at) { |id| lookup(id) }
+  end
+
+  # A Signature header signed here: `params` before `signature`.
+  def signed(covered: Array[String], params: String = "keyId=\"Test\",algorithm=\"rsa-sha256\"",
+             method: String = "POST", target: String = TARGET, h: HTTP::Headers = headers,
+             created: String? = nil, expires: String? = nil) -> String
+    text = HTTPSignatures.signing_string(method, target, h, covered, created: created, expires: expires)
+    sig = key.sign(text, :sha256)
+    "#{params},headers=\"#{covered.join(" ")}\",signature=\"#{Base64.encode(sig)}\""
+  end
+
+  # C.1, its Authorization form: `date` by default for rsa-sha256.
+  def test_appendix_c_default
+    sig = "keyId=\"Test\",algorithm=\"rsa-sha256\",signature=\"SjWJWbWN7i0wzBvtPl8rbASWz5xQW6mcJmn+ibttBqtifLN7Sazz6m79cNfwwb8DMJ5cou1s7uEGKKCs+FLEEaDV5lp7q25WqS+lavg7T8hc0GppauB6hbgEKTwblDHYGEtbGmtdHgVCk9SuS13F0hZ8FD0k/5OxEPXe5WozsbM=\""
+    v = run(request(headers({"Authorization" => "Signature #{sig}"})), ["date"], false)
+    assert_equal("Test", v.key_id)
+    assert_equal("rsa-sha256", v.algorithm)
+    assert_equal(["date"], v.headers)
+    assert_equal(BODY.to_bytes, v.body)
+  end
+
+  # C.2, its Signature form.
+  def test_appendix_c_basic
+    sig = "keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",signature=\"qdx+H7PHHDZgy4y/Ahn9Tny9V3GP6YgBPyUXMmoxWtLbHpUnXS2mg2+SbrQDMCJypxBLSPQR2aAjn7ndmw2iicw3HMbe8VfEdKFYRqzic+efkb3nndiv/x1xSHDJWeSWkx3ButlYSuBskLu6kd9Fswtemr3lgdDEmn04swr2Os0=\""
+    v = run(request(headers({"Signature" => sig})), require_digest: false)
+    assert_equal(["(request-target)", "host", "date"], v.headers)
+    # The body is not covered: refused unless asked not to.
+    e = assert_raise(HTTPSignatures::DigestMismatch) { run(request(headers({"Signature" => sig}))); nil }
+    assert_equal("the signature covers no Digest header for the body", e.message)
+  end
+
+  # C.3's signature, with the `headers` its signing string covers.
+  def test_appendix_c_all_headers
+    sig = "keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date content-type digest content-length\",signature=\"vSdrb+dS3EceC9bcwHSo4MlyKS59iFIrhgYkz8+oVLEEzmYZZvRs8rgOp+63LEM3v+MFHB32NfpB2bEKBIvB1q52LaEUHFv120V01IL+TAD48XaERZFukWgHoBTLMhYS2Gb51gWxpeIq8knRmPnYePbF5MOkR0Zkly4zKH7s1dE=\""
+    v = run(request(headers({"Signature" => sig})))
+    assert_equal(6, v.headers.size)
+    # The body changed: its Digest no longer matches.
+    e = assert_raise(HTTPSignatures::DigestMismatch) { run(request(headers({"Signature" => sig}), body: BODY + " ")); nil }
+    assert_equal("the body does not match its Digest header", e.message)
+  end
+
+  # hs2019 with an RSA key: PKCS#1 v1.5 with SHA-256, or RSASSA-PSS with
+  # SHA-512 (with a key large enough for it: the draft's 1024-bit key is
+  # not).
+  def test_hs2019_both_ways
+    covered = ["(request-target)", "(created)", "host", "date", "digest"]
+    created = now.to_i.to_s
+    params = "keyId=\"Test\",algorithm=\"hs2019\",created=#{created}"
+    v = run(request(headers({"Signature" => signed(covered, params, created: created)})))
+    assert_equal("hs2019", v.algorithm)
+    big = Crypto::RSA::PrivateKey.generate(2048)
+    text = HTTPSignatures.signing_string("POST", TARGET, headers, covered, created: created)
+    pss = "keyId=\"Big\",algorithm=\"hs2019\",created=#{created},headers=\"#{covered.join(" ")}\"," +
+          "signature=\"#{Base64.encode(big.sign_pss(text, :sha512))}\""
+    big_public = big.public_key
+    v = HTTPSignatures.verify(request(headers({"Signature" => pss})), now: now) { |id| id == "Big" ? big_public : nil }
+    assert_equal("Big", v.key_id)
+    # No algorithm counts as hs2019; its default covers `(created)`.
+    text = HTTPSignatures.signing_string("POST", TARGET, headers, ["(created)"], created: created)
+    bare = "keyId=\"Test\",created=#{created},signature=\"#{Base64.encode(key.sign(text, :sha256))}\""
+    v = run(request(headers({"Signature" => bare})), ["(created)"], false)
+    assert_equal(["(created)"], v.headers)
+  end
+
+  # Spaces, another order, a keyId that is a URL with a fragment, an
+  # unknown parameter, lowercase names and a lowercase Digest name.
+  def test_interop_forms
+    h = headers.put("digest", "sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=")
+    covered = ["(request-target)", "host", "date", "digest"]
+    text = HTTPSignatures.signing_string("POST", TARGET, h, covered)
+    sig = Base64.encode(key.sign(text, :sha256))
+    header = "signature=\"#{sig}\", headers=\"(request-target) host date digest\", algorithm=\"RSA-SHA256\", " +
+             "keyId=\"https://example.com/actor#main-key\", foo=\"bar\""
+    v = HTTPSignatures.verify(request(h.add("Signature", header)), now: now) do |id|
+      id == "https://example.com/actor#main-key" ? public_key : nil
+    end
+    assert_equal("https://example.com/actor#main-key", v.key_id)
+  end
+
+  def test_multi_valued_headers
+    h = headers.add("X-Tag", "a").add("x-tag", " b ")
+    sig = signed(["(request-target)", "host", "date", "digest", "x-tag"], h: h)
+    assert_equal(5, run(request(h.add("Signature", sig))).headers.size)
+  end
+
+  def test_missing_signature
+    e = assert_raise(HTTPSignatures::MissingSignature) { run(request(headers)); nil }
+    assert_equal("the request has no Signature header", e.message)
+    assert_raise(HTTPSignatures::MissingSignature) { run(request(headers({"Authorization" => "Bearer x"}))); nil }
+  end
+
+  def data_malformed -> Hash[String, [String, String]]
+    {
+      "no keyId" => ["algorithm=\"rsa-sha256\",headers=\"date\",signature=\"AAAA\"", "the signature has no keyId"],
+      "no signature" => ["keyId=\"Test\",headers=\"date\"", "the signature has no signature parameter"],
+      "twice" => ["keyId=\"Test\",keyId=\"Other\",signature=\"AAAA\"", "the signature has a parameter twice"],
+      "unclosed quote" => ["keyId=\"Test,signature=\"AAAA\"", "the signature's parameters do not parse"],
+      "no equals" => ["keyId,signature=\"AAAA\"", "the signature's parameters do not parse"],
+      "no comma" => ["keyId=\"Test\" signature=\"AAAA\"", "the signature's parameters do not parse"],
+      "empty headers" => ["keyId=\"Test\",headers=\"\",signature=\"AAAA\"", "the signature covers no headers"],
+      "repeated header" => ["keyId=\"Test\",headers=\"date date\",signature=\"AAAA\"", "the signature covers a header twice"],
+      "too many" => ["keyId=\"Test\",headers=\"#{(1..33).map { |i| "x-#{i}" }.join(" ")}\",signature=\"AAAA\"",
+                     "the signature covers more than 32 headers"],
+      "created with rsa" => ["keyId=\"Test\",algorithm=\"rsa-sha256\",created=1,headers=\"(created) date\",signature=\"AAAA\"",
+                             "rsa-sha256 does not allow (created) or (expires)"],
+      "created not a number" => ["keyId=\"Test\",created=\"x\",headers=\"(created) date\",signature=\"AAAA\"", "created is not an integer"],
+      "bad name" => ["keyId=\"Test\",headers=\"date x:y\",signature=\"AAAA\"", "covered name 2 is not a header name"],
+      "not base64" => ["keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"date\",signature=\"!!\"", "the signature parameter is not Base64"],
+    }
+  end
+
+  def test_malformed(data: [String, String])
+    header, message = data
+    e = assert_raise(HTTPSignatures::MalformedSignature) { run(request(headers({"Signature" => header})), ["date"], false); nil }
+    assert_equal(message, e.message)
+  end
+
+  def test_two_signature_headers
+    h = headers({"Signature" => "keyId=\"Test\",signature=\"AAAA\""}).add("Signature", "keyId=\"Test\",signature=\"AAAA\"")
+    assert_raise_message("the request has more than one Signature header") { run(request(h)); nil }
+  end
+
+  def test_unsupported_algorithm
+    ["hmac-sha256", "rsa-sha1", "ecdsa-sha256"].each do |alg|
+      h = headers({"Signature" => "keyId=\"Test\",algorithm=\"#{alg}\",headers=\"date\",signature=\"AAAA\""})
+      assert_raise_message("the signature's algorithm is not rsa-sha256 or hs2019") { run(request(h), ["date"]); nil }
+    end
+  end
+
+  def test_required_headers
+    sig = signed(["host", "date", "digest"])
+    e = assert_raise(HTTPSignatures::MissingHeader) { run(request(headers({"Signature" => sig}))); nil }
+    assert_equal("the signature does not cover (request-target)", e.message)
+    # Covered, but absent from the request.
+    sig = signed(["(request-target)", "host", "date", "digest", "x-absent"], h: headers({"X-Absent" => "1"}))
+    e = assert_raise(HTTPSignatures::MissingHeader) { run(request(headers({"Signature" => sig}))); nil }
+    assert_equal("the request has no x-absent header", e.message)
+  end
+
+  def test_times
+    sig = signed(["(request-target)", "host", "date", "digest"])
+    req = -> { request(headers({"Signature" => sig})) }
+    run(req.call, at: now + 5.minutes)
+    run(req.call, at: now - 5.minutes)
+    e = assert_raise(HTTPSignatures::Expired) { run(req.call, at: now + 5.minutes + 1.second); nil }
+    assert_equal("the Date header is more than 300s from now", e.message)
+    assert_raise(HTTPSignatures::Expired) { run(req.call, at: now - 6.minutes); nil }
+    covered = ["(request-target)", "(created)", "(expires)", "host", "digest"]
+    created = now.to_i.to_s
+    expires = (now.to_i + 60).to_s
+    params = "keyId=\"Test\",algorithm=\"hs2019\",created=#{created},expires=#{expires}.5"
+    sig2 = signed(covered, params, created: created, expires: "#{expires}.5")
+    req2 = -> { request(headers({"Signature" => sig2})) }
+    run(req2.call, ["(request-target)"], at: now)
+    assert_raise_message("the signature was created in the future") { run(req2.call, ["(request-target)"], at: now - 6.minutes); nil }
+    assert_raise_message("the signature has expired") { run(req2.call, ["(request-target)"], at: now + 7.minutes); nil }
+    bad = headers({"Signature" => sig}).put("date", "yesterday")
+    assert_raise_message("the Date header is not an HTTP date") { run(request(bad)); nil }
+  end
+
+  # `created` older than the window: refused, unless a covered `expires`
+  # has not passed; an uncovered `expires` does not widen it.
+  def test_created_too_long_ago
+    created = (now.to_i - 3600).to_s
+    covered = ["(request-target)", "(created)", "host", "digest"]
+    old = signed(covered, "keyId=\"Test\",algorithm=\"hs2019\",created=#{created}", created: created)
+    assert_raise_message("the signature was created too long ago") { run(request(headers({"Signature" => old})), ["(request-target)"]); nil }
+    # With a covered `expires` still ahead, the signer's window governs.
+    later = (now.to_i + 600).to_s
+    with_expires = covered + ["(expires)"]
+    good = signed(with_expires, "keyId=\"Test\",algorithm=\"hs2019\",created=#{created},expires=#{later}",
+                  created: created, expires: later)
+    run(request(headers({"Signature" => good})), ["(request-target)"])
+    # The same `expires` not covered: refused.
+    uncovered = signed(covered, "keyId=\"Test\",algorithm=\"hs2019\",created=#{created},expires=#{later}", created: created)
+    assert_raise_message("the signature was created too long ago") { run(request(headers({"Signature" => uncovered})), ["(request-target)"]); nil }
+    # An uncovered `expires` that has passed still refuses (it only narrows).
+    past = (now.to_i - 600).to_s
+    fresh = now.to_i.to_s
+    narrowed = signed(covered, "keyId=\"Test\",algorithm=\"hs2019\",created=#{fresh},expires=#{past}", created: fresh)
+    assert_raise_message("the signature has expired") { run(request(headers({"Signature" => narrowed})), ["(request-target)"]); nil }
+  end
+
+  # The Date that is checked is the one that is signed: two are refused.
+  def test_two_dates
+    h = headers.add("Date", "Sun, 05 Jan 2014 21:31:41 GMT")
+    sig = signed(["(request-target)", "host", "date", "digest"], h: h)
+    assert_raise_message("the request has more than one Date header") { run(request(h.add("Signature", sig))); nil }
+  end
+
+  # Whatever a peer puts in a parameter or a header, only an
+  # HTTPSignatures::Error comes out.
+  def data_garbage -> Hash[String, String]
+    good = "headers=\"(request-target) host date digest\",signature=\"AAAA\""
+    {
+      "created 30 digits" => "keyId=\"Test\",algorithm=\"hs2019\",created=#{"1" * 30},headers=\"(created)\",signature=\"AAAA\"",
+      "expires 400 digits" => "keyId=\"Test\",algorithm=\"hs2019\",created=1,expires=#{"9" * 400},headers=\"(created)\",signature=\"AAAA\"",
+      "expires long fraction" => "keyId=\"Test\",algorithm=\"hs2019\",created=1,expires=1.#{"9" * 400},headers=\"(created)\",signature=\"AAAA\"",
+      "expires two points" => "keyId=\"Test\",algorithm=\"hs2019\",created=1,expires=1.2.3,headers=\"(created)\",signature=\"AAAA\"",
+      "negative created" => "keyId=\"Test\",algorithm=\"hs2019\",created=-1,headers=\"(created)\",signature=\"AAAA\"",
+      "long signature" => "keyId=\"Test\",#{good.sub("AAAA", "A" * 20_000)}",
+      "short signature" => "keyId=\"Test\",#{good.sub("AAAA", "AA==")}",
+      "hs2019 long signature" => "keyId=\"Test\",algorithm=\"hs2019\",#{good.sub("AAAA", "A" * 4_000)}",
+      "odd headers" => "keyId=\"Test\",headers=\"date\t(x) ;\",signature=\"AAAA\"",
+      "empty keyId" => "keyId=\"\",#{good}",
+      "long algorithm" => "keyId=\"Test\",algorithm=\"#{"x" * 1000}\",#{good}",
+      "only commas" => ",,,",
+      "empty" => "",
+    }
+  end
+
+  def test_garbage(data: String)
+    assert_raise(HTTPSignatures::Error) { run(request(headers({"Signature" => data}))); nil }
+  end
+
+  def test_garbage_headers
+    sig = signed(["(request-target)", "host", "date", "digest"])
+    [headers.put("date", "x" * 1000), headers.put("digest", "SHA-256=#{"A" * 1000}"), headers.put("digest", "=;=, ,SHA-256")].each do |h|
+      assert_raise(HTTPSignatures::Error) { run(request(h.add("Signature", sig))); nil }
+    end
+  end
+
+  def test_unknown_key
+    sig = signed(["(request-target)", "host", "date", "digest"], "keyId=\"Other\",algorithm=\"rsa-sha256\"")
+    e = assert_raise(HTTPSignatures::UnknownKey) { run(request(headers({"Signature" => sig}))); nil }
+    assert_equal("no key for the signature's keyId", e.message)
+  end
+
+  # Anything the signature covers changed, or another key.
+  def test_bad_signature
+    covered = ["(request-target)", "host", "date", "digest"]
+    sig = signed(covered)
+    [request(headers({"Signature" => sig}), "PUT"),
+     request(headers({"Signature" => sig}), target: "/foo?param=value&pet=cat"),
+     request(headers({"Signature" => sig}).put("host", "example.org"))].each do |req|
+      assert_raise_message("the signature does not verify with the key") { run(req); nil }
+    end
+    other = Crypto::RSA::PrivateKey.generate(2048)
+    text = HTTPSignatures.signing_string("POST", TARGET, headers, covered)
+    forged = "keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"#{covered.join(" ")}\",signature=\"#{Base64.encode(other.sign(text, :sha256))}\""
+    assert_raise(HTTPSignatures::BadSignature) { run(request(headers({"Signature" => forged}))); nil }
+    # rsa-sha256 is PKCS#1 v1.5 only: a PSS signature does not verify.
+    big = Crypto::RSA::PrivateKey.generate(2048)
+    pss = "keyId=\"Big\",algorithm=\"rsa-sha256\",headers=\"#{covered.join(" ")}\"," +
+          "signature=\"#{Base64.encode(big.sign_pss(text, :sha512))}\""
+    big_public = big.public_key
+    assert_raise(HTTPSignatures::BadSignature) do
+      HTTPSignatures.verify(request(headers({"Signature" => pss})), now: now) { |id| id == "Big" ? big_public : nil }
+      nil
+    end
+  end
+
+  # An empty body needs no Digest; a covered Digest is still checked.
+  def test_empty_body
+    h = headers.delete("digest").delete("content-length").delete("content-type")
+    sig = signed(["(request-target)", "host", "date"], h: h, method: "GET")
+    v = run(request(h.add("Signature", sig), "GET", body: ""))
+    assert(v.body.empty?)
+  end
+
+  # Every error is an HTTPSignatures::Error.
+  def test_one_root
+    errors: Array[HTTPSignatures::Error] = [
+      HTTPSignatures::MissingSignature.new("x"), HTTPSignatures::MalformedSignature.new("x"),
+      HTTPSignatures::UnknownKey.new("x"), HTTPSignatures::UnsupportedAlgorithm.new("x"),
+      HTTPSignatures::MissingHeader.new("x"), HTTPSignatures::Expired.new("x"),
+      HTTPSignatures::DigestMismatch.new("x"), HTTPSignatures::BadSignature.new("x"),
+    ]
+    assert_equal(8, errors.size)
+  end
+end
