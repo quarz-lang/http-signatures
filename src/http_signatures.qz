@@ -3,6 +3,3 @@
 # `Digest` header (RFC 3230) of the body it covers.
 #
 # The design and its decisions are in issue #1.
-
-# The version of the cog.
-VERSION = "0.1.0"
