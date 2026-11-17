@@ -1,0 +1,157 @@
+require "test"
+require "http"
+require "crypto"
+require "base64"
+
+class SignTest < Test::Case
+  BODY = "{\"hello\": \"world\"}"
+  DATE = "Sun, 05 Jan 2014 21:31:40 GMT"
+
+  def key -> Crypto::RSA::PrivateKey = Crypto::RSA::PrivateKey.from_pem(File.read("test/fixtures/draft_test_key.pem"))
+  def now -> Time = Time.httpdate(DATE)
+
+  # The draft's Appendix C request, as a client's.
+  def appendix_request -> HTTP::Client::Request
+    HTTP::Client::Request.post("http://example.com/foo?param=value&pet=dog", body: BODY, content_type: "application/json")
+                         .header("Date", DATE)
+  end
+
+  # C.2, signed here: the draft's signature, byte for byte.
+  def test_appendix_c_basic
+    signed = HTTPSignatures.sign(appendix_request, key_id: "Test", key: key, headers: ["(request-target)", "host", "date"], now: now)
+    assert_equal("keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\"," +
+                 "signature=\"qdx+H7PHHDZgy4y/Ahn9Tny9V3GP6YgBPyUXMmoxWtLbHpUnXS2mg2+SbrQDMCJypxBLSPQR2aAjn7ndmw2iicw3HMbe8VfEdKFYRqzic+efkb3nndiv/x1xSHDJWeSWkx3ButlYSuBskLu6kd9Fswtemr3lgdDEmn04swr2Os0=\"",
+                 signed.headers["signature"])
+    # Nothing else changed.
+    assert_equal(appendix_request.headers.entries.size + 1, signed.headers.entries.size)
+    assert_equal("POST", signed.method)
+  end
+
+  # The default covers `(request-target) host date digest`, adding Date
+  # and Digest.
+  def test_adds_date_and_digest
+    req = HTTP::Client::Request.post("http://example.com/foo?param=value&pet=dog", body: BODY, content_type: "application/json")
+    signed = HTTPSignatures.sign(req, key_id: "Test", key: key, now: now)
+    assert_equal(DATE, signed.headers["date"])
+    assert_equal("SHA-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=", signed.headers["digest"])
+    assert_match(/headers="\(request-target\) host date digest"/, signed.headers["signature"] || "")
+    # Given ones are kept.
+    kept = HTTPSignatures.sign(req.header("Date", "Mon, 06 Jan 2014 00:00:00 GMT").header("Digest", "SHA-256=AAAA"),
+                               key_id: "Test", key: key, now: now)
+    assert_equal("Mon, 06 Jan 2014 00:00:00 GMT", kept.headers["date"])
+    assert_equal("SHA-256=AAAA", kept.headers["digest"])
+    # An empty body's and a binary one's.
+    empty = HTTPSignatures.sign(HTTP::Client::Request.get("http://example.com/"), key_id: "Test", key: key, now: now)
+    assert_equal("SHA-256=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=", empty.headers["digest"])
+    binary = HTTPSignatures.sign(HTTP::Client::Request.post("http://example.com/", body: BODY.to_bytes), key_id: "Test", key: key, now: now)
+    assert_equal("SHA-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=", binary.headers["digest"])
+  end
+
+  def test_hs2019_and_times
+    created = now
+    expires = now + 60.seconds
+    signed = HTTPSignatures.sign(appendix_request, key_id: "Test", key: key, algorithm: "hs2019",
+                                 headers: ["(request-target)", "(created)", "(expires)", "host", "digest"],
+                                 created: created, expires: expires, now: now)
+    sig = signed.headers["signature"] || ""
+    assert_match(/\AkeyId="Test",algorithm="hs2019",created=#{now.to_i},expires=#{now.to_i + 60},headers="/, sig)
+    # `(created)` without `created` takes `now`.
+    plain = HTTPSignatures.sign(appendix_request, key_id: "Test", key: key, algorithm: "HS2019", headers: ["(created)"], now: now)
+    assert_match(/created=#{now.to_i},/, plain.headers["signature"] || "")
+  end
+
+  def test_errors
+    req = appendix_request
+    assert_raise_message("sign: algorithm is rsa-sha256 or hs2019, not \"hmac-sha256\"") do
+      HTTPSignatures.sign(req, key_id: "Test", key: key, algorithm: "hmac-sha256")
+      nil
+    end
+    assert_raise_message("sign: rsa-sha256 does not allow (created) or (expires)") do
+      HTTPSignatures.sign(req, key_id: "Test", key: key, headers: ["(created)"])
+      nil
+    end
+    assert_raise_message("sign: (expires) is covered but expires is not given") do
+      HTTPSignatures.sign(req, key_id: "Test", key: key, algorithm: "hs2019", headers: ["(expires)"])
+      nil
+    end
+    assert_raise_message("sign: the request has no x-absent header") do
+      HTTPSignatures.sign(req, key_id: "Test", key: key, headers: ["x-absent"])
+      nil
+    end
+    assert_raise_message("sign: covered name 1 is not a header name") do
+      HTTPSignatures.sign(req, key_id: "Test", key: key, headers: ["x y"])
+      nil
+    end
+    stream = HTTP::Client::Request.stream("POST", "http://example.com/") { |w| w.write("x") }
+    assert_raise_message("sign: a streamed body has no Digest to compute") do
+      HTTPSignatures.sign(stream, key_id: "Test", key: key)
+      nil
+    end
+    # Without `digest`, a streamed body can be signed.
+    HTTPSignatures.sign(stream, key_id: "Test", key: key, headers: ["(request-target)", "host", "date"])
+  end
+end
+
+# Signed by the client, verified by a server: what is signed is what is
+# sent.
+class SignRoundTripTest < Test::Case
+  def key -> Crypto::RSA::PrivateKey = Crypto::RSA::PrivateKey.from_pem(File.read("test/fixtures/draft_test_key.pem"))
+
+  def serving(public_key: Crypto::RSA::PublicKey, &: (String) -> Void) -> Void
+    handler = HTTP.handler do |req|
+      begin
+        v = HTTPSignatures.verify(req) { |id| id.start_with?("key-") ? public_key : nil }
+        HTTP::Server::Response.text("#{v.key_id} #{v.algorithm} #{v.headers.join(" ")} #{v.body.size}")
+      rescue HTTPSignatures::Error => e
+        HTTP::Server::Response.text("#{e.class.name}: #{e.message}", 401)
+      end
+    end
+    server = HTTP::Server.new(handler, host: "127.0.0.1", port: 0)
+    Task.scope do |scope|
+      scope.spawn { server.serve }
+      begin
+        yield "http://127.0.0.1:#{server.local_address.port}"
+      ensure
+        server.shutdown
+      end
+    end
+    nil
+  end
+
+  def test_round_trips
+    pub = key.public_key
+    serving(pub) do |base|
+      c = HTTP::Client.new
+      cases = [
+        HTTP::Client::Request.post("#{base}/inbox?a=1&b=%20", body: "{\"x\": 1}", content_type: "application/json"),
+        HTTP::Client::Request.post("#{base}/bytes", body: Bytes.from([0, 255, 10])),
+        HTTP::Client::Request.get("#{base}/"),
+        HTTP::Client::Request.get("#{base}", {"Host" => "spoofed.example"}),
+      ]
+      cases.each do |req|
+        res = c.request(HTTPSignatures.sign(req, key_id: "key-1", key: key))
+        assert_equal(200, res.status, res.body.read)
+      end
+      res = c.request(HTTPSignatures.sign(cases[0], key_id: "key-1\"quoted\\", key: key))
+      assert_equal("key-1\"quoted\\ rsa-sha256 (request-target) host date digest 8", res.body.read)
+      hs = HTTPSignatures.sign(cases[0], key_id: "key-2", key: key, algorithm: "hs2019",
+                               headers: ["(request-target)", "(created)", "host", "date", "digest"])
+      assert_equal("key-2 hs2019 (request-target) (created) host date digest 8", c.request(hs).body.read)
+      # Changed after signing: refused.
+      tampered = HTTPSignatures.sign(cases[0], key_id: "key-1", key: key).with(url: "#{base}/inbox?a=2&b=%20")
+      res = c.request(tampered)
+      assert_equal(401, res.status)
+      assert_equal("HTTPSignatures::BadSignature: the signature does not verify with the key", res.body.read)
+    end
+  end
+
+  # hs2019 with RSASSA-PSS and SHA-512 (a key large enough for it).
+  def test_hs2019_pss
+    big = Crypto::RSA::PrivateKey.generate(2048)
+    serving(big.public_key) do |base|
+      req = HTTP::Client::Request.post("#{base}/x", body: "pss")
+      signed = HTTPSignatures.sign(req, key_id: "key-pss", key: big, algorithm: "hs2019", hs2019_pss: true)
+      assert_equal("key-pss hs2019 (request-target) host date digest 3", HTTP::Client.new.request(signed).body.read)
+    end
+  end
+end
