@@ -1,0 +1,46 @@
+# The root of every error this cog raises when it verifies a request:
+# `rescue HTTPSignatures::Error` catches them all (and a server answers
+# 401). A message names the reason; it never quotes a header's value,
+# and quotes a name only once it is known to be a field name. (An
+# argument a method cannot take is an `ArgumentError`, as anywhere.)
+class Error < StandardError
+end
+
+# The request has no Signature header, nor an Authorization header of
+# the Signature scheme.
+class MissingSignature < Error
+end
+
+# The signature's parameters do not parse: a parameter given twice, no
+# `keyId` or `signature`, a `signature` that is not Base64, an empty or
+# repeated name in `headers`, `(created)` or `(expires)` without its
+# parameter or with an algorithm that does not allow it.
+class MalformedSignature < Error
+end
+
+# No key for the signature's `keyId`.
+class UnknownKey < Error
+end
+
+# The signature's `algorithm` is not one this cog verifies.
+class UnsupportedAlgorithm < Error
+end
+
+# A header the signature covers is not in the request, or one that must
+# be covered is not.
+class MissingHeader < Error
+end
+
+# The signature is not valid now: its Date header is too far from now,
+# `created` is in the future, or `expires` has passed.
+class Expired < Error
+end
+
+# The body does not match the `Digest` the signature covers, the body has
+# no covered `Digest`, or the `Digest` has no SHA-256 entry.
+class DigestMismatch < Error
+end
+
+# The signature does not verify with the key.
+class BadSignature < Error
+end

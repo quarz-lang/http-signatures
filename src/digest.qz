@@ -1,0 +1,42 @@
+require "digest"
+require "base64"
+require "crypto"
+
+# The `Digest` header of RFC 3230 with its `SHA-256` algorithm: what a
+# signature covers to cover the body.
+#
+# ```
+# HTTPSignatures::Digest.header('{"hello": "world"}')
+# # => "SHA-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE="
+# HTTPSignatures::Digest.matches?("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=", '{"hello": "world"}')
+# # => true
+# ```
+module Digest
+  # The header's value for `body` (a `String`'s UTF-8 bytes):
+  # `SHA-256=` and the Base64 of its SHA-256.
+  def self.header(body: Bytes | String) -> String = "SHA-256=#{Base64.encode(::Digest::SHA256.digest(body))}"
+
+  # The SHA-256 the header's value gives, or nil when it has no
+  # `SHA-256` entry or that entry is not Base64. The value is a list
+  # (`SHA-256=…, SHA-512=…`); algorithm names are compared without
+  # regard to case.
+  def self.sha256(header: String) -> Bytes?
+    header.split(",").each do |entry|
+      name, eq, value = entry.strip.partition("=")
+      next if eq.empty? || name.strip.downcase != "sha-256"
+      return begin
+        Base64.decode(value.strip)
+      rescue ArgumentError
+        nil
+      end
+    end
+    nil
+  end
+
+  # Whether the header's value has a `SHA-256` entry that is the SHA-256
+  # of `body`, compared in constant time.
+  def self.matches?(header: String, body: Bytes | String) -> Bool
+    want = sha256(header)
+    !want.nil? && Crypto.secure_compare(want, ::Digest::SHA256.digest(body))
+  end
+end

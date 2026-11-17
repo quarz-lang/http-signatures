@@ -1,0 +1,67 @@
+require "test"
+require "http"
+require "crypto"
+require "base64"
+
+# The test vectors of draft-cavage-http-signatures-12, Appendix C: its
+# request, its test key (test/fixtures/README.md), and for each case the
+# signing string and the `rsa-sha256` signature it prints.
+class VectorsTest < Test::Case
+  def key -> Crypto::RSA::PrivateKey = Crypto::RSA::PrivateKey.from_pem(File.read("test/fixtures/draft_test_key.pem"))
+  def public_key -> Crypto::RSA::PublicKey = Crypto::RSA::PublicKey.from_pem(File.read("test/fixtures/draft_test_key.pub.pem"))
+
+  # POST /foo?param=value&pet=dog with its headers.
+  def headers -> HTTP::Headers
+    HTTP::Headers.empty
+      .add("Host", "example.com")
+      .add("Date", "Sun, 05 Jan 2014 21:31:40 GMT")
+      .add("Content-Type", "application/json")
+      .add("Digest", "SHA-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=")
+      .add("Content-Length", "18")
+  end
+
+  def string(covered: Array[String]) -> String
+    HTTPSignatures.signing_string("POST", "/foo?param=value&pet=dog", headers, covered)
+  end
+
+  def check(covered: Array[String], expected_string: String, signature: String) -> Void
+    s = string(covered)
+    assert_equal(expected_string, s)
+    assert_equal(signature, Base64.encode(key.sign(s, :sha256)))
+    assert(public_key.verify(s, Base64.decode(signature), :sha256))
+  end
+
+  # The public key printed is the private key's.
+  def test_the_keys_agree
+    assert_equal(public_key.to_pem, key.public_key.to_pem)
+  end
+
+  # C.1: `date` alone (no `headers` parameter).
+  def test_default
+    check(["date"], "date: Sun, 05 Jan 2014 21:31:40 GMT",
+          "SjWJWbWN7i0wzBvtPl8rbASWz5xQW6mcJmn+ibttBqtifLN7Sazz6m79cNfwwb8DMJ5cou1s7uEGKKCs+FLEEaDV5lp7q25WqS+lavg7T8hc0GppauB6hbgEKTwblDHYGEtbGmtdHgVCk9SuS13F0hZ8FD0k/5OxEPXe5WozsbM=")
+  end
+
+  # C.2: `(request-target) host date`.
+  def test_basic
+    check(["(request-target)", "host", "date"],
+          "(request-target): post /foo?param=value&pet=dog\nhost: example.com\ndate: Sun, 05 Jan 2014 21:31:40 GMT",
+          "qdx+H7PHHDZgy4y/Ahn9Tny9V3GP6YgBPyUXMmoxWtLbHpUnXS2mg2+SbrQDMCJypxBLSPQR2aAjn7ndmw2iicw3HMbe8VfEdKFYRqzic+efkb3nndiv/x1xSHDJWeSWkx3ButlYSuBskLu6kd9Fswtemr3lgdDEmn04swr2Os0=")
+  end
+
+  # C.3: every header. The draft's `headers` parameter there also names
+  # `(created)` and `(expires)`, which its signing string leaves out (and
+  # which `rsa-sha256` does not allow): the signature printed is of the
+  # string printed, as tested here.
+  def test_all_headers
+    check(["(request-target)", "host", "date", "content-type", "digest", "content-length"],
+          "(request-target): post /foo?param=value&pet=dog\nhost: example.com\ndate: Sun, 05 Jan 2014 21:31:40 GMT\n" +
+            "content-type: application/json\ndigest: SHA-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=\ncontent-length: 18",
+          "vSdrb+dS3EceC9bcwHSo4MlyKS59iFIrhgYkz8+oVLEEzmYZZvRs8rgOp+63LEM3v+MFHB32NfpB2bEKBIvB1q52LaEUHFv120V01IL+TAD48XaERZFukWgHoBTLMhYS2Gb51gWxpeIq8knRmPnYePbF5MOkR0Zkly4zKH7s1dE=")
+  end
+
+  # The body's Digest the request carries is the body's.
+  def test_the_digest
+    assert_equal(headers["digest"], HTTPSignatures::Digest.header("{\"hello\": \"world\"}"))
+  end
+end

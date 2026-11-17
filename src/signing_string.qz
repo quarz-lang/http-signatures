@@ -1,0 +1,56 @@
+require "http"
+
+# The signing string of draft-cavage-http-signatures-12 (§2.3): for each
+# covered name in order, a line `name: value`, the lines joined by `\n`.
+#
+# - `(request-target)`: the method lowercased, a space and the target as
+#   sent (path and query): `post /foo?param=value&pet=dog`;
+# - `(created)`, `(expires)`: the signature's parameter, as written;
+# - a header: its values with leading and trailing spaces and tabs
+#   removed, joined by `, ` in the request's order (`cache-control:
+#   max-age=60, must-revalidate`); an empty value gives `name: `.
+#
+# Names are compared without regard to case and written lowercased. A
+# covered name is `(request-target)`, `(created)`, `(expires)` or an HTTP
+# field name (token characters, RFC 9110 §5.1).
+#
+# ```
+# headers = HTTP::Headers.of({"Host" => "example.com", "Date" => "Sun, 05 Jan 2014 21:31:40 GMT"})
+# HTTPSignatures.signing_string("POST", "/foo?param=value&pet=dog", headers, ["(request-target)", "host", "date"])
+# # => "(request-target): post /foo?param=value&pet=dog\nhost: example.com\ndate: Sun, 05 Jan 2014 21:31:40 GMT"
+# ```
+#
+# ## Raises
+#
+# `MissingHeader` for a covered header the request does not have, and
+# `MalformedSignature` for `(created)` or `(expires)` without its value,
+# an empty list of names, or a name that is none of the above (the
+# message gives its position in the list, never the name itself, which
+# may come from a peer).
+public def signing_string(method: String, target: String, headers: HTTP::Headers, covered: Array[String],
+                          created: String? = nil, expires: String? = nil) -> String
+  raise MalformedSignature.new("no headers are covered") if covered.empty?
+  covered.each_with_index do |n, i|
+    unless n.match?(FIELD_NAME) || ["(request-target)", "(created)", "(expires)"].include?(n.downcase)
+      raise MalformedSignature.new("covered name #{i + 1} is not a header name")
+    end
+  end
+  lines = covered.map do |covered_name|
+    name = covered_name.downcase
+    value = case name
+            when "(request-target)" then "#{method.downcase} #{target}"
+            when "(created)" then created || raise(MalformedSignature.new("(created) is covered but created is not given"))
+            when "(expires)" then expires || raise(MalformedSignature.new("(expires) is covered but expires is not given"))
+            else
+              values = headers.all(name)
+              raise MissingHeader.new("the request has no #{name} header") if values.empty?
+              values.map { |v| v.strip }.join(", ")
+            end
+    "#{name}: #{value}"
+  end
+  lines.join("\n")
+end
+
+# :nodoc:
+# An HTTP field name: one or more token characters (RFC 9110 §5.6.2).
+FIELD_NAME = /\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\z/
