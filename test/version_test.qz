@@ -2,6 +2,6 @@ require "test"
 
 class VersionTest < Test::Case
   def test_version
-    assert_equal("0.1.0", HTTPSignatures::VERSION)
+    assert_equal("0.1.0", cog.version)
   end
 end
