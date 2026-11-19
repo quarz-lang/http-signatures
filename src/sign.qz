@@ -11,7 +11,7 @@ require "base64"
 # - the Digest header is set to the body's SHA-256 (`SHA-256=…`) when
 #   `digest` is covered and the request has none;
 # - `(request-target)` and `host` are what the client sends:
-#   `HTTP::Client::Request#target` and `HTTP::Client::Request#host`.
+#   [HTTP::Client::Request#target] and [HTTP::Client::Request#host].
 #
 # `algorithm` is `"rsa-sha256"` (RSASSA-PKCS1-v1_5 with SHA-256, what
 # most verifiers accept) or `"hs2019"`, which signs the same way unless
@@ -28,7 +28,7 @@ require "base64"
 #
 # ## Raises
 #
-# `ArgumentError` for another algorithm, an empty `headers`, a covered
+# [ArgumentError] for another algorithm, an empty `headers`, a covered
 # header the request does not have, a covered name that is no header
 # name, `(created)` or `(expires)` with rsa-sha256, `(expires)` without
 # `expires`, or a `digest` to compute for a streamed body.
