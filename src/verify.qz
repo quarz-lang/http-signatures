@@ -56,7 +56,7 @@ end
 #   `expires` has not passed: the signer's window then governs);
 #   `expires` no earlier than `now - max_skew`. A `required` without
 #   `date` leaves freshness to `(created)` and `(expires)`;
-# - the signature of the signing string (`HTTPSignatures.signing_string`)
+# - the signature of the signing string ([HTTPSignatures.signing_string])
 #   with the key;
 # - the body, only once the signature has verified: read whole (`HTTP::Body#read_bytes(max: max_body_bytes)`, the
 #   server's limit at most) and, when it is not empty or a Digest header
@@ -65,10 +65,10 @@ end
 #
 # ## Raises
 #
-# An `HTTPSignatures::Error` saying why: `MissingSignature`,
-# `MalformedSignature`, `UnsupportedAlgorithm`, `MissingHeader`,
-# `Expired`, `UnknownKey`, `BadSignature` or `DigestMismatch`. Reading the
-# body raises as `HTTP::Body#read_bytes` does (`HTTP::PayloadTooLarge` past the
+# An [HTTPSignatures::Error] saying why: [MissingSignature],
+# [MalformedSignature], [UnsupportedAlgorithm], [MissingHeader],
+# [Expired], [UnknownKey], [BadSignature] or [DigestMismatch]. Reading the
+# body raises as [HTTP::Body#read_bytes] does ([HTTP::PayloadTooLarge] past the
 # limit).
 public def verify(request: HTTP::Server::Request, *, required: Array[String] = ["(request-target)", "host", "date"],
                   max_skew: Duration = 5.minutes, max_body_bytes: Int? = nil, require_digest: Bool = true,

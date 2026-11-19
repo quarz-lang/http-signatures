@@ -2,7 +2,7 @@ require "digest"
 require "base64"
 require "crypto"
 
-# The `Digest` header of RFC 3230 with its `SHA-256` algorithm: what a
+# The [Digest] header of RFC 3230 with its `SHA-256` algorithm: what a
 # signature covers to cover the body.
 #
 # ```
@@ -12,7 +12,7 @@ require "crypto"
 # # => true
 # ```
 module Digest
-  # The header's value for `body` (a `String`'s UTF-8 bytes):
+  # The header's value for `body` (a [String]'s UTF-8 bytes):
   # `SHA-256=` and the Base64 of its SHA-256.
   def self.header(body: Bytes | String) -> String = "SHA-256=#{Base64.encode(::Digest::SHA256.digest(body))}"
 

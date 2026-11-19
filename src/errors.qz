@@ -2,7 +2,7 @@
 # `rescue HTTPSignatures::Error` catches them all (and a server answers
 # 401). A message names the reason; it never quotes a header's value,
 # and quotes a name only once it is known to be a field name. (An
-# argument a method cannot take is an `ArgumentError`, as anywhere.)
+# argument a method cannot take is an [ArgumentError], as anywhere.)
 class Error < StandardError
 end
 
@@ -36,8 +36,8 @@ end
 class Expired < Error
 end
 
-# The body does not match the `Digest` the signature covers, the body has
-# no covered `Digest`, or the `Digest` has no SHA-256 entry.
+# The body does not match the [Digest] the signature covers, the body has
+# no covered [Digest], or the [Digest] has no SHA-256 entry.
 class DigestMismatch < Error
 end
 

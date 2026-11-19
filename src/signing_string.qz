@@ -22,8 +22,8 @@ require "http"
 #
 # ## Raises
 #
-# `MissingHeader` for a covered header the request does not have, and
-# `MalformedSignature` for `(created)` or `(expires)` without its value,
+# [MissingHeader] for a covered header the request does not have, and
+# [MalformedSignature] for `(created)` or `(expires)` without its value,
 # an empty list of names, or a name that is none of the above (the
 # message gives its position in the list, never the name itself, which
 # may come from a peer).
