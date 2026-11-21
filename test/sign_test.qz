@@ -159,3 +159,28 @@ class SignRoundTripTest < Test::Case
     end
   end
 end
+
+# The key held natively by quarz (quarz-lang/quarz#963): read from a
+# Bytes::Secret, it signs as the same key read from text; wiped, it
+# raises.
+class SignSecretKeyTest < Test::Case
+  def pem -> Bytes = File.read_bytes("test/fixtures/draft_test_key.pem")
+
+  def test_a_key_read_from_a_secret_signs_the_same
+    from_text = Crypto::RSA::PrivateKey.from_pem(pem)
+    from_secret = Crypto::RSA::PrivateKey.from_pem(Bytes::Secret.of(pem))
+    assert_equal(from_text, from_secret)
+    req = HTTP::Client::Request.get("https://example.com/foo?param=value")
+    now = Time.utc(2014, 1, 5, 21, 31, 40)
+    a = HTTPSignatures.sign(req, key_id: "k", key: from_text, now: now)
+    b = HTTPSignatures.sign(req, key_id: "k", key: from_secret, now: now)
+    assert_equal(a.headers["signature"], b.headers["signature"])
+  end
+
+  def test_a_wiped_key_raises
+    key = Crypto::RSA::PrivateKey.from_pem(pem)
+    key.wipe
+    req = HTTP::Client::Request.get("https://example.com/foo")
+    assert_raise(Bytes::Secret::WipedError) { HTTPSignatures.sign(req, key_id: "k", key: key) }
+  end
+end
