@@ -24,6 +24,18 @@ signed = HTTPSignatures.sign(req, key_id: "client-1", key: key)
 HTTP::Client.default.request(signed)
 ```
 
+The key is held natively by quarz: parsed once, never a `Bytes` in the
+value, cleared when the last reference goes. `key.wipe` ends it for
+every holder at once (a `sign` with it then raises
+`Bytes::Secret::WipedError`). `from_pem` also takes a `Bytes::Secret`,
+for a PEM that should not stay in memory as a `String`:
+
+```crystal
+key = Crypto::RSA::PrivateKey.from_pem(Bytes::Secret.of(File.read_bytes("private.pem")))
+# ... sign with it ...
+key.wipe
+```
+
 `sign` gives a copy of the request with a `Signature` header. By default
 it covers `(request-target) host date digest`, adding [Date] and
 [Digest] when the request has none; `(request-target)` and `host` are

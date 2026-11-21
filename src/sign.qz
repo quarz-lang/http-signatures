@@ -26,6 +26,9 @@ require "base64"
 # HTTP::Client.default.request(signed)
 # ```
 #
+# `key` is held natively by quarz (cleared when released); a wiped one
+# raises [Bytes::Secret::WipedError] here, as any use of it does.
+#
 # ## Raises
 #
 # [ArgumentError] for another algorithm, an empty `headers`, a covered
