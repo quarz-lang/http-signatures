@@ -67,6 +67,18 @@ the covered [Digest] (a body no [Digest] covers is refused unless
 [HTTPSignatures::Error] whose message says why and quotes nothing the
 peer sent.
 
+`lenient: true` (off by default) also takes forms the draft does not
+allow and signers in use send: whitespace or the URL-safe alphabet in
+the signature's Base64, a `created` with a fraction (dropped), a bare
+value running to the next comma (trimmed), empty entries after a comma,
+and a parameter given twice, of which the **first** is used. Careful
+with the last one: anything else reading the same header (a proxy, a
+log, another verifier) must take the same one, or it sees another
+`keyId` or `headers` than the one verified; the default refuses a
+parameter given twice. The signing string is built from the parameters
+as used (the first of a repeated one, a bare value trimmed, `created`
+as written).
+
 The block is given the peer's `keyId` before anything is verified: a
 block that fetches a key by it must check it first (a URL to fetch is a
 request the peer chose).

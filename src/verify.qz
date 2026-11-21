@@ -77,6 +77,29 @@ end
 #   is covered, compared with that Digest (`require_digest: false`
 #   accepts a body no Digest covers).
 #
+# ## Forms deployed signers send: `lenient: true`
+#
+# Off by default. With `lenient: true`, these forms of the parameters,
+# which the draft does not allow and signers in use send, are taken (and
+# nothing else is loosened):
+#
+# - spaces and tabs inside the `signature` parameter's Base64 (removed), and
+#   the URL-safe alphabet (`-`, `_`), padded or not;
+# - a `created` with a fraction (`1700000000.5`: the fraction is dropped
+#   for the time check); `expires` takes one in either mode;
+# - a bare (unquoted) value running to the next comma, trimmed
+#   (`algorithm=rsa-sha256 ,`);
+# - empty entries after a comma (`keyId="a",,signature="..."`);
+# - a parameter given twice: the FIRST value is used, the others
+#   ignored. Careful: a verifier and another party reading the same
+#   header (a proxy, a log, a second verifier) must agree on which value
+#   counts; one that takes the last would see another `keyId` or
+#   `headers` than the one verified. The default refuses it.
+#
+# The signing string is built from the parameters as used: the first of
+# a repeated one, a bare value trimmed, `created` and `expires` as
+# written (what the signer signed).
+#
 # ## A body the application read first
 #
 # With `body:` given, `verify` reads nothing: it checks the Digest
@@ -127,9 +150,10 @@ end
 public def verify(request: HTTP::Server::Request, *, body: Bytes? = nil,
                   required: Array[String] = ["(request-target)", "host", "date"],
                   max_skew: Duration = 5.minutes, max_body_bytes: Int? = nil, require_digest: Bool = true,
-                  now: Time = Time.now, &key: (String) -> Crypto::RSA::PublicKey?) -> Verified
+                  now: Time = Time.now, lenient: Bool = false,
+                  &key: (String) -> Crypto::RSA::PublicKey?) -> Verified
   signed = verify_signature(request.method, request.target, request.headers, required: required,
-                            max_skew: max_skew, now: now, &key)
+                            max_skew: max_skew, now: now, lenient: lenient, &key)
   read = body || request.body.read_bytes(max: max_body_bytes)
   if signed.headers.include?("digest")
     digest = request.headers.all("digest").join(", ")
@@ -163,9 +187,9 @@ end
 # [Expired], [UnknownKey] or [BadSignature].
 public def verify_signature(method: String, target: String, headers: HTTP::Headers, *,
                             required: Array[String] = ["(request-target)", "host", "date"],
-                            max_skew: Duration = 5.minutes, now: Time = Time.now,
+                            max_skew: Duration = 5.minutes, now: Time = Time.now, lenient: Bool = false,
                             &key: (String) -> Crypto::RSA::PublicKey?) -> Signed
-  params = Verify.params(Verify.signature_text(headers))
+  params = Verify.params(Verify.signature_text(headers), lenient)
   key_id = params["keyid"]? || raise(MalformedSignature.new("the signature has no keyId"))
   sig_text = params["signature"]? || raise(MalformedSignature.new("the signature has no signature parameter"))
   algorithm = (params["algorithm"]? || "hs2019").downcase
@@ -178,10 +202,12 @@ public def verify_signature(method: String, target: String, headers: HTTP::Heade
   end
   created = params["created"]?
   expires = params["expires"]?
-  Verify.check_times(headers, covered, created, expires, max_skew, now)
+  Verify.check_times(headers, covered, created, expires, max_skew, now, lenient)
+  # (The signing string has the parameters as written: what the signer
+  # signed.)
   text = signing_string(method, target, headers, covered, created: created, expires: expires)
   signature = begin
-    Base64.decode(sig_text)
+    Base64.decode(lenient ? Verify.standard_base64(sig_text) : sig_text)
   rescue ArgumentError
     raise MalformedSignature.new("the signature parameter is not Base64")
   end
@@ -222,10 +248,19 @@ module Verify
     raise MissingSignature.new("the request has no Signature header")
   end
 
+  # A signature's Base64 as `lenient` takes it: spaces and tabs removed, the
+  # URL-safe alphabet's `-` and `_` read as `+` and `/` (padded or not,
+  # as `Base64.decode` takes it).
+  def self.standard_base64(text: String) -> String
+    text.gsub(/[ \t]/, "").tr("-_", "+/")
+  end
+
   # The parameters by lowercased name: `name="quoted"` or `name=bare`,
   # separated by commas. A parameter given twice, or a list that does
-  # not parse, is malformed.
-  def self.params(text: String) -> Hash[String, String]
+  # not parse, is malformed. `lenient` (`verify`'s): a bare value runs to
+  # the next comma, trimmed; empty entries after a comma are skipped; a
+  # parameter given twice keeps its FIRST value.
+  def self.params(text: String, lenient: Bool = false) -> Hash[String, String]
     out: Hash[String, String] = {}
     chars = text.chars
     i = 0
@@ -258,18 +293,28 @@ module Verify
           end
         end
         raise MalformedSignature.new("the signature's parameters do not parse") unless closed
+      elsif lenient
+        start = i
+        i += 1 while i < chars.size && chars[i] != ","
+        value << chars[start...i].join.strip
       else
         while i < chars.size && chars[i] != "," && chars[i] != " " && chars[i] != "\t"
           value << chars[i]
           i += 1
         end
       end
-      raise MalformedSignature.new("the signature has a parameter twice") if out.key?(name)
-      out = out.put(name, value.to_s)
+      if out.key?(name)
+        raise MalformedSignature.new("the signature has a parameter twice") unless lenient
+      else
+        out = out.put(name, value.to_s)
+      end
       i += 1 while i < chars.size && (chars[i] == " " || chars[i] == "\t")
       break if i >= chars.size
       raise MalformedSignature.new("the signature's parameters do not parse") unless chars[i] == ","
       i += 1
+      if lenient
+        i += 1 while i < chars.size && (chars[i] == " " || chars[i] == "\t" || chars[i] == ",")
+      end
     end
     out
   end
@@ -294,7 +339,7 @@ module Verify
   # Raises `Expired` (or `MalformedSignature` for a time that does not
   # parse) unless the signature is valid at `now`.
   def self.check_times(headers: HTTP::Headers, covered: Array[String], created: String?, expires: String?,
-                       max_skew: Duration, now: Time) -> Void
+                       max_skew: Duration, now: Time, lenient: Bool = false) -> Void
     if covered.include?("date")
       # (The Date that is checked is the one that is signed.)
       dates = headers.all("date")
@@ -316,8 +361,10 @@ module Verify
       raise Expired.new("the signature has expired")
     end
     if created
-      raise MalformedSignature.new("created is not an integer") unless created.match?(/\A[0-9]{1,12}\z/)
-      created_at = Time.at(created.to_i)
+      # (`lenient`: a fraction, dropped.)
+      form = lenient ? /\A[0-9]{1,12}(\.[0-9]{1,9})?\z/ : /\A[0-9]{1,12}\z/
+      raise MalformedSignature.new("created is not an integer") unless created.match?(form)
+      created_at = Time.at(created.partition(".")[0].to_i)
       raise Expired.new("the signature was created in the future") if created_at - now > max_skew
       # Older than the window: refused, unless a signed `expires` (which
       # has not passed) sets the signer's own window. An `expires` the

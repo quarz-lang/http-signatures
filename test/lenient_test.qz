@@ -1,0 +1,137 @@
+require "test"
+require "http"
+require "crypto"
+require "base64"
+
+# #11: `lenient: true` takes the forms deployed signers send; the default
+# refuses each of them as before.
+class LenientTest < Test::Case
+  DATE = "Sun, 05 Jan 2014 21:31:40 GMT"
+  TARGET = "/foo?param=value&pet=dog"
+  COVERED = ["(request-target)", "host", "date"]
+
+  def key -> Crypto::RSA::PrivateKey = Crypto::RSA::PrivateKey.from_pem(File.read("test/fixtures/draft_test_key.pem"))
+  def public_key -> Crypto::RSA::PublicKey = Crypto::RSA::PublicKey.from_pem(File.read("test/fixtures/draft_test_key.pub.pem"))
+  def now -> Time = Time.httpdate(DATE)
+
+  def headers -> HTTP::Headers = HTTP::Headers.empty.add("Host", "example.com").add("Date", DATE)
+
+  # The Base64 signature of the signing string over `covered`.
+  def sig(covered: Array[String] = COVERED, created: String? = nil, pss: Bool = false) -> String
+    text = HTTPSignatures.signing_string("GET", TARGET, headers, covered, created: created)
+    Base64.encode(pss ? key.sign_pss(text, :sha512) : key.sign(text, :sha256))
+  end
+
+  # `verify_signature` of a request whose Signature header is `header`.
+  def check(header: String, lenient: Bool, required: Array[String] = COVERED) -> HTTPSignatures::Signed
+    HTTPSignatures.verify_signature("GET", TARGET, headers.add("Signature", header), required: required,
+                                    now: now, lenient: lenient) { |id| id == "Test" ? public_key : nil }
+  end
+
+  # `header` refused by default with `message`, taken with `lenient: true`.
+  def lenient_only(header: String, message: String, required: Array[String] = COVERED) -> HTTPSignatures::Signed
+    e = assert_raise(HTTPSignatures::MalformedSignature) { check(header, false, required); nil }
+    assert_equal(message, e.message)
+    check(header, true, required)
+  end
+
+  def test_whitespace_in_the_base64
+    s = sig
+    spaced = "#{s[0, 20]} #{s[20, 20]}\t#{s[40, 20]}  #{s[60..]}"
+    header = "keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",signature=\"#{spaced}\""
+    assert_equal("Test", lenient_only(header, "the signature parameter is not Base64").key_id)
+  end
+
+  def test_the_url_safe_alphabet
+    # A signature whose Base64 has a `+` or a `/`: the draft key's over
+    # these names has both.
+    s = sig
+    assert_true(s.include?("+") || s.include?("/"), s)
+    url = s.tr("+/", "-_")
+    [url, url.delete("=")].each do |form|
+      header = "keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",signature=\"#{form}\""
+      assert_equal("Test", lenient_only(header, "the signature parameter is not Base64").key_id)
+    end
+  end
+
+  def test_a_created_with_a_fraction
+    covered = ["(request-target)", "host", "(created)"]
+    created = "#{now.to_i}.5"
+    header = "keyId=\"Test\",algorithm=\"hs2019\",created=#{created},headers=\"(request-target) host (created)\"," +
+             "signature=\"#{sig(covered, created)}\""
+    s = lenient_only(header, "created is not an integer", ["(request-target)", "host"])
+    assert_equal(covered, s.headers)
+    # The time check uses the whole seconds: a fraction does not carry it
+    # past the window.
+    late = "#{now.to_i - 300}.9"
+    header = "keyId=\"Test\",algorithm=\"hs2019\",created=#{late},headers=\"(request-target) host (created)\"," +
+             "signature=\"#{sig(covered, late)}\""
+    assert_equal("Test", check(header, true, ["(request-target)", "host"]).key_id)
+    early = "#{now.to_i - 301}.0"
+    header = "keyId=\"Test\",algorithm=\"hs2019\",created=#{early},headers=\"(request-target) host (created)\"," +
+             "signature=\"#{sig(covered, early)}\""
+    assert_raise(HTTPSignatures::Expired) { check(header, true, ["(request-target)", "host"]); nil }
+    # Not a number either way.
+    header = "keyId=\"Test\",algorithm=\"hs2019\",created=1.2.3,headers=\"(created)\",signature=\"AAAA\""
+    assert_raise_message("created is not an integer") { check(header, true, Array[String].new); nil }
+  end
+
+  # `expires` takes a fraction in either mode (as before).
+  def test_an_expires_with_a_fraction
+    covered = ["(request-target)", "host", "(expires)"]
+    expires = "#{now.to_i + 60}.25"
+    text = HTTPSignatures.signing_string("GET", TARGET, headers, covered, expires: expires)
+    header = "keyId=\"Test\",algorithm=\"hs2019\",expires=#{expires},headers=\"(request-target) host (expires)\"," +
+             "signature=\"#{Base64.encode(key.sign(text, :sha256))}\""
+    [false, true].each { |l| assert_equal("Test", check(header, l, ["(request-target)", "host"]).key_id) }
+  end
+
+  def test_a_bare_value_up_to_the_comma
+    header = "keyId=Test ,algorithm= rsa-sha256 ,headers=\"(request-target) host date\",signature=\"#{sig}\""
+    # (Strict: a bare value then a space and a comma is taken already.)
+    assert_equal("Test", check(header, false).key_id)
+    inside = "keyId=Test key,algorithm=rsa-sha256,headers=\"(request-target) host date\",signature=\"#{sig}\""
+    e = assert_raise(HTTPSignatures::MalformedSignature) { check(inside, false); nil }
+    assert_equal("the signature's parameters do not parse", e.message)
+    # Lenient: `Test key`, a keyId with no key.
+    assert_raise(HTTPSignatures::UnknownKey) { check(inside, true); nil }
+    spaced = "keyId=\"Test\",algorithm=rsa-sha256 \t,headers=\"(request-target) host date\",signature=\"#{sig}\""
+    assert_equal("rsa-sha256", check(spaced, true).algorithm)
+  end
+
+  def test_empty_entries
+    header = "keyId=\"Test\",,algorithm=\"rsa-sha256\", ,headers=\"(request-target) host date\",,,signature=\"#{sig}\""
+    assert_equal("Test", lenient_only(header, "the signature's parameters do not parse").key_id)
+    # Before the first entry: refused either way.
+    first = ",keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",signature=\"#{sig}\""
+    [false, true].each { |l| assert_raise(HTTPSignatures::MalformedSignature) { check(first, l); nil } }
+  end
+
+  # The first of a repeated parameter is used: for the key, the covered
+  # names and the signature alike.
+  def test_a_parameter_twice
+    header = "keyId=\"Test\",keyId=\"Other\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\"," +
+             "signature=\"#{sig}\",signature=\"AAAA\""
+    assert_equal("Test", lenient_only(header, "the signature has a parameter twice").key_id)
+    other_first = "keyId=\"Other\",keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",signature=\"#{sig}\""
+    assert_raise(HTTPSignatures::UnknownKey) { check(other_first, true); nil }
+    # The covered names: the first `headers`, which the signing string
+    # follows (a second naming fewer does not narrow it).
+    covers = "keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",headers=\"date\",signature=\"#{sig}\""
+    assert_equal(COVERED, check(covers, true).headers)
+    narrower = "keyId=\"Test\",algorithm=\"rsa-sha256\",headers=\"date\",headers=\"(request-target) host date\",signature=\"#{sig}\""
+    assert_raise(HTTPSignatures::MissingHeader) { check(narrower, true); nil }
+  end
+
+  # verify takes the option too, and passes it on.
+  def test_verify_takes_it
+    header = "keyId=\"Test\",keyId=\"Other\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",signature=\"#{sig}\""
+    req = HTTP::Server::Request.build("GET", TARGET, headers.add("Signature", header), "")
+    assert_raise(HTTPSignatures::MalformedSignature) do
+      HTTPSignatures.verify(req, now: now) { |id| id == "Test" ? public_key : nil }
+      nil
+    end
+    v = HTTPSignatures.verify(req, now: now, lenient: true) { |id| id == "Test" ? public_key : nil }
+    assert_equal("Test", v.key_id)
+  end
+end
