@@ -60,7 +60,8 @@ end
 `verify` checks, in order: the parameters (from `Signature`, or
 `Authorization: Signature`), the algorithm, the covered names, that
 `required:` names (by default `(request-target) host date`) are covered,
-the time ([Date], `created`, `expires` within `max_skew:`, five minutes),
+the time (a covered [Date] and a covered `created` within `max_skew:`,
+five minutes, either way; `expires` not passed, with no allowance),
 the signature with the key the block gives, and then the body against
 the covered [Digest] (a body no [Digest] covers is refused unless
 `require_digest: false`). Each failure raises a subclass of
@@ -109,10 +110,26 @@ key (a peer that rotated its key) works.
 - The draft's Appendix C test vectors, checked byte for byte.
 
 Not supported: HMAC, ECDSA and Ed25519 keys; `rsa-sha1`; `(created)` or
-`(expires)` with `rsa-sha256` (the draft forbids them there); other
+`(expires)` with `rsa-sha256` (the draft forbids them there; verifying
+accepts them with `lenient: true`); other
 [Digest] algorithms and RFC 9530's `Content-Digest`; RFC 9421 (HTTP
 Message Signatures), the draft's standard successor; signing a streamed
 body's [Digest]; signing responses.
+
+## Changes
+
+- #14: the times are checked as verifiers in use check them. Two
+  requests accepted before are now refused:
+  - a signature whose `expires` has passed, even by less than
+    `max_skew` (the signer's deadline gets no allowance);
+  - a covered `created` older than `max_skew`, even with a covered
+    `expires` not passed (the signer's window no longer widens
+    `max_skew`).
+
+  And two refused before are now accepted: a `created` the signature
+  does not cover, older than `max_skew` (only one more than `max_skew`
+  in the future is refused); and, with `lenient: true`, `(created)` or
+  `(expires)` covered by an `rsa-sha256` signature.
 
 ## License
 

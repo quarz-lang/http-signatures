@@ -1,0 +1,112 @@
+require "test"
+require "http"
+require "crypto"
+require "base64"
+
+# #14: the time rules, each at its boundary (one second either side),
+# strict and lenient, through `verify` and `verify_signature` alike.
+#
+# - `expires` (covered or not): refused as soon as it has passed;
+# - a covered `created`: within `max_skew` of now, either way, whatever
+#   `expires` says;
+# - a `created` not covered: refused only more than `max_skew` in the
+#   future;
+# - `rsa-sha256` covering `(created)`/`(expires)`: refused, accepted
+#   with `lenient: true`.
+class TimesTest < Test::Case
+  TARGET = "/t"
+  T = 1_700_000_000
+  SKEW = 300
+
+  def key -> Crypto::RSA::PrivateKey = Crypto::RSA::PrivateKey.from_pem(File.read("test/fixtures/draft_test_key.pem"))
+  def public_key -> Crypto::RSA::PublicKey = Crypto::RSA::PublicKey.from_pem(File.read("test/fixtures/draft_test_key.pub.pem"))
+  def headers -> HTTP::Headers = HTTP::Headers.empty.add("Host", "example.com")
+
+  # A Signature header over `covered`, with `created`/`expires` given as
+  # parameters (covered or not).
+  def header(covered: Array[String], created: Int? = nil, expires: Int? = nil, algorithm: String = "hs2019") -> String
+    c = created&.to_s
+    x = expires&.to_s
+    text = HTTPSignatures.signing_string("POST", TARGET, headers, covered,
+                                         created: covered.include?("(created)") ? c : nil,
+                                         expires: covered.include?("(expires)") ? x : nil)
+    params = "keyId=\"Test\",algorithm=\"#{algorithm}\""
+    params += ",created=#{c}" if c
+    params += ",expires=#{x}" if x
+    "#{params},headers=\"#{covered.join(" ")}\",signature=\"#{Base64.encode(key.sign(text, :sha256))}\""
+  end
+
+  # "ok", or the message of what `verify` raised at `at` (seconds since
+  # 1970); `verify_signature` must answer the same.
+  def outcome(sig: String, at: Int, lenient: Bool) -> String
+    h = headers.add("Signature", sig)
+    now = Time.at(at)
+    one = begin
+      HTTPSignatures.verify(HTTP::Server::Request.build("POST", TARGET, h, ""), required: ["(request-target)"],
+                            now: now, lenient: lenient) { |id| id == "Test" ? public_key : nil }
+      "ok"
+    rescue HTTPSignatures::Error => e
+      "#{e.class.name}: #{e.message}"
+    end
+    two = begin
+      HTTPSignatures.verify_signature("POST", TARGET, h, required: ["(request-target)"], now: now,
+                                      lenient: lenient) { |id| id == "Test" ? public_key : nil }
+      "ok"
+    rescue HTTPSignatures::Error => e
+      "#{e.class.name}: #{e.message}"
+    end
+    assert_equal(one, two, "verify and verify_signature at #{at}")
+    one
+  end
+
+  # `expected` at each of `ats`, strict and lenient.
+  def both(sig: String, cases: Hash[Int, String]) -> Void
+    [false, true].each do |lenient|
+      cases.each { |at, expected| assert_equal(expected, outcome(sig, at, lenient), "at #{at - T}, lenient: #{lenient}") }
+    end
+  end
+
+  EXPIRED = "HTTPSignatures::Expired: the signature has expired"
+  TOO_OLD = "HTTPSignatures::Expired: the signature was created too long ago"
+  FUTURE = "HTTPSignatures::Expired: the signature was created in the future"
+
+  # Row 1: `expires` passed by one second is refused (before #14 it took
+  # `max_skew` more), covered or not.
+  def test_expires_has_no_allowance
+    covered = header(["(request-target)", "(expires)"], expires: T)
+    both(covered, {T - 1 => "ok", T => "ok", T + 1 => EXPIRED, T + SKEW => EXPIRED})
+    uncovered = header(["(request-target)"], expires: T)
+    both(uncovered, {T => "ok", T + 1 => EXPIRED})
+  end
+
+  # Row 2: a covered `created` within `max_skew` either way, a covered
+  # `expires` far ahead or not (before #14 that `expires` widened it).
+  def test_a_covered_created_keeps_its_window
+    plain = header(["(request-target)", "(created)"], created: T)
+    widened = header(["(request-target)", "(created)", "(expires)"], created: T, expires: T + 3600)
+    [plain, widened].each do |sig|
+      both(sig, {T - SKEW - 1 => FUTURE, T - SKEW => "ok", T => "ok", T + SKEW => "ok", T + SKEW + 1 => TOO_OLD})
+    end
+  end
+
+  # Row 3: a `created` the signature does not cover: any age (before #14
+  # refused past `max_skew`), but not more than `max_skew` in the future.
+  def test_an_uncovered_created
+    sig = header(["(request-target)"], created: T)
+    both(sig, {T - SKEW - 1 => FUTURE, T - SKEW => "ok", T + SKEW + 1 => "ok", T + 86_400 => "ok"})
+  end
+
+  # Row 4: rsa-sha256 covering `(created)` or `(expires)`: refused by
+  # default, accepted with `lenient: true`, its times checked as above.
+  def test_rsa_sha256_with_created_or_expires
+    refused = "HTTPSignatures::MalformedSignature: rsa-sha256 does not allow (created) or (expires)"
+    created = header(["(request-target)", "(created)"], created: T, algorithm: "rsa-sha256")
+    expires = header(["(request-target)", "(expires)"], expires: T, algorithm: "rsa-sha256")
+    [created, expires].each do |sig|
+      assert_equal(refused, outcome(sig, T, false))
+      assert_equal("ok", outcome(sig, T, true))
+    end
+    assert_equal(TOO_OLD, outcome(created, T + SKEW + 1, true))
+    assert_equal(EXPIRED, outcome(expires, T + 1, true))
+  end
+end
