@@ -64,12 +64,20 @@ end
 # - the covered names: `headers`, or by default `date` for `rsa-sha256`
 #   and `(created)` for `hs2019`; at most 32, none twice, each in
 #   `required` among them. `(created)` and `(expires)` are refused with
-#   `rsa-sha256`;
+#   `rsa-sha256` (accepted with `lenient: true`);
 # - the time: a covered Date header (one only) within `max_skew` of
-#   `now`; `created` within `max_skew` of `now` (no older when a covered
-#   `expires` has not passed: the signer's window then governs);
-#   `expires` no earlier than `now - max_skew`. A `required` without
-#   `date` leaves freshness to `(created)` and `(expires)`;
+#   `now`, either way; a covered `created` within `max_skew` of `now`,
+#   either way, whatever `expires` says; a `created` the signature does
+#   not cover only not more than `max_skew` in the future (it protects
+#   nothing); `expires`, covered or not, not passed (`now` after it is
+#   refused, with no `max_skew` allowance). A `required` without `date`
+#   leaves freshness to `(created)` and `(expires)`.
+#
+#   Since #14, two of these refuse requests accepted before: an
+#   `expires` passed by less than `max_skew`, and a covered `created`
+#   older than `max_skew` with a covered `expires` not passed (the
+#   signer's window no longer widens `max_skew`). A `created` not
+#   covered and older than `max_skew` is now accepted;
 # - the signature of the signing string ([HTTPSignatures.signing_string])
 #   with the key;
 # - the body, only once the signature has verified: read whole (`HTTP::Body#read_bytes(max: max_body_bytes)`, the
@@ -196,7 +204,7 @@ public def verify_signature(method: String, target: String, headers: HTTP::Heade
   unless algorithm == "rsa-sha256" || algorithm == "hs2019"
     raise UnsupportedAlgorithm.new("the signature's algorithm is not rsa-sha256 or hs2019")
   end
-  covered = Verify.covered(params["headers"]?, algorithm)
+  covered = Verify.covered(params["headers"]?, algorithm, lenient)
   required.each do |name|
     raise MissingHeader.new("the signature does not cover #{name.downcase}") unless covered.include?(name.downcase)
   end
@@ -321,7 +329,7 @@ module Verify
 
   # The covered names, lowercased: the `headers` parameter's, or the
   # algorithm's default.
-  def self.covered(headers: String?, algorithm: String) -> Array[String]
+  def self.covered(headers: String?, algorithm: String, lenient: Bool = false) -> Array[String]
     names = if headers.nil?
               [algorithm == "rsa-sha256" ? "date" : "(created)"]
             else
@@ -330,7 +338,7 @@ module Verify
     raise MalformedSignature.new("the signature covers no headers") if names.empty?
     raise MalformedSignature.new("the signature covers more than #{MAX_COVERED} headers") if names.size > MAX_COVERED
     raise MalformedSignature.new("the signature covers a header twice") if names.uniq.size != names.size
-    if algorithm == "rsa-sha256" && (names.include?("(created)") || names.include?("(expires)"))
+    if !lenient && algorithm == "rsa-sha256" && (names.include?("(created)") || names.include?("(expires)"))
       raise MalformedSignature.new("rsa-sha256 does not allow (created) or (expires)")
     end
     names
@@ -356,8 +364,8 @@ module Verify
     if expires && !expires.match?(/\A[0-9]{1,12}(\.[0-9]{1,9})?\z/)
       raise MalformedSignature.new("expires is not a number")
     end
-    expires_at = expires ? Time.at(expires.to_f) : nil
-    if expires_at && now - expires_at > max_skew
+    # (Passed is passed: the signer's deadline gets no allowance.)
+    if expires && now > Time.at(expires.to_f)
       raise Expired.new("the signature has expired")
     end
     if created
@@ -366,10 +374,10 @@ module Verify
       raise MalformedSignature.new("created is not an integer") unless created.match?(form)
       created_at = Time.at(created.partition(".")[0].to_i)
       raise Expired.new("the signature was created in the future") if created_at - now > max_skew
-      # Older than the window: refused, unless a signed `expires` (which
-      # has not passed) sets the signer's own window. An `expires` the
-      # signature does not cover can only narrow, never widen.
-      if now - created_at > max_skew && !(expires_at && covered.include?("(expires)"))
+      # Older than the window: refused when the signature covers it,
+      # whatever `expires` says. One it does not cover protects nothing:
+      # only the future is refused, as a parameter that makes no sense.
+      if covered.include?("(created)") && now - created_at > max_skew
         raise Expired.new("the signature was created too long ago")
       end
     end

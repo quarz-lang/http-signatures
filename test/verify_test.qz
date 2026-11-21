@@ -196,23 +196,25 @@ class VerifyTest < Test::Case
     assert_raise_message("the Date header is not an HTTP date") { run(request(bad)); nil }
   end
 
-  # `created` older than the window: refused, unless a covered `expires`
-  # has not passed; an uncovered `expires` does not widen it.
+  # `created` older than the window: refused when covered, a covered
+  # `expires` still ahead included (#14: the signer's window no longer
+  # widens `max_skew`, which this test accepted before); an `expires`
+  # that has passed refuses, covered or not.
   def test_created_too_long_ago
     created = (now.to_i - 3600).to_s
     covered = ["(request-target)", "(created)", "host", "digest"]
     old = signed(covered, "keyId=\"Test\",algorithm=\"hs2019\",created=#{created}", created: created)
     assert_raise_message("the signature was created too long ago") { run(request(headers({"Signature" => old})), ["(request-target)"]); nil }
-    # With a covered `expires` still ahead, the signer's window governs.
+    # With a covered `expires` still ahead: refused too (#14).
     later = (now.to_i + 600).to_s
     with_expires = covered + ["(expires)"]
-    good = signed(with_expires, "keyId=\"Test\",algorithm=\"hs2019\",created=#{created},expires=#{later}",
-                  created: created, expires: later)
-    run(request(headers({"Signature" => good})), ["(request-target)"])
+    ahead = signed(with_expires, "keyId=\"Test\",algorithm=\"hs2019\",created=#{created},expires=#{later}",
+                   created: created, expires: later)
+    assert_raise_message("the signature was created too long ago") { run(request(headers({"Signature" => ahead})), ["(request-target)"]); nil }
     # The same `expires` not covered: refused.
     uncovered = signed(covered, "keyId=\"Test\",algorithm=\"hs2019\",created=#{created},expires=#{later}", created: created)
     assert_raise_message("the signature was created too long ago") { run(request(headers({"Signature" => uncovered})), ["(request-target)"]); nil }
-    # An uncovered `expires` that has passed still refuses (it only narrows).
+    # An uncovered `expires` that has passed still refuses.
     past = (now.to_i - 600).to_s
     fresh = now.to_i.to_s
     narrowed = signed(covered, "keyId=\"Test\",algorithm=\"hs2019\",created=#{fresh},expires=#{past}", created: fresh)
