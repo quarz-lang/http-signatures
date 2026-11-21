@@ -2,6 +2,19 @@ require "http"
 require "crypto"
 require "base64"
 
+# What a verified signature was made with: [HTTPSignatures.verify_signature]
+# gives it, and [HTTPSignatures.verify] with the body ([Verified]).
+data Signed(
+  # The signature's `keyId`, the key the block gave for it verified.
+  key_id: String,
+  # The signature's algorithm: `"rsa-sha256"` or `"hs2019"` (also when
+  # the signature names none).
+  algorithm: String,
+  # The names the signature covers, lowercased, in its order.
+  headers: Array[String]
+)
+end
+
 # What a verified request was signed with, and its body.
 data Verified(
   # The signature's `keyId`, the key the block gave for it verified.
@@ -12,7 +25,8 @@ data Verified(
   # The names the signature covers, lowercased, in its order.
   headers: Array[String],
   # The request's body, read whole to check its Digest: use it, the
-  # request's body has been read.
+  # request's body has been read. With `body:` given to `verify`, that
+  # body.
   body: Bytes
 )
 end
@@ -63,6 +77,46 @@ end
 #   is covered, compared with that Digest (`require_digest: false`
 #   accepts a body no Digest covers).
 #
+# ## A body the application read first
+#
+# With `body:` given, `verify` reads nothing: it checks the Digest
+# against `body`, and `Verified#body` is `body`. For an application that
+# reads the body first (its own limit, a key found from the body, the
+# body of a request that fails kept):
+#
+# ```quarz no_run
+# keys: Hash[String, Crypto::RSA::PublicKey] = {}   # keyId => key
+# handler = HTTP.handler do |req|
+#   body = req.body.read_bytes(max: 1_000_000)
+#   v = HTTPSignatures.verify(req, body: body) { |key_id| keys[key_id]? }
+#   HTTP::Server::Response.text("signed by #{v.key_id}: #{body.size} bytes")
+# end
+# ```
+#
+# A failure then needs no body of its own: the application holds it.
+# [HTTPSignatures.verify_signature] verifies the signature alone, for
+# the two steps apart ([HTTPSignatures::Digest.matches?] is the other).
+#
+# ## Another key after BadSignature
+#
+# The body is read only once the signature has verified, so a request
+# whose signature does not verify with the key given ([BadSignature])
+# can be verified again, with a refreshed key (a peer that rotated its
+# key): call `verify` a second time on the same request.
+#
+# ```quarz no_run
+# cached: Hash[String, Crypto::RSA::PublicKey] = {}      # keyId => key, as known
+# refreshed: Hash[String, Crypto::RSA::PublicKey] = {}   # keyId => key, fetched again
+# handler = HTTP.handler do |req|
+#   v = begin
+#     HTTPSignatures.verify(req) { |key_id| cached[key_id]? }
+#   rescue HTTPSignatures::BadSignature
+#     HTTPSignatures.verify(req) { |key_id| refreshed[key_id]? }
+#   end
+#   HTTP::Server::Response.text("signed by #{v.key_id}")
+# end
+# ```
+#
 # ## Raises
 #
 # An [HTTPSignatures::Error] saying why: [MissingSignature],
@@ -70,10 +124,48 @@ end
 # [Expired], [UnknownKey], [BadSignature] or [DigestMismatch]. Reading the
 # body raises as [HTTP::Body#read_bytes] does ([HTTP::PayloadTooLarge] past the
 # limit).
-public def verify(request: HTTP::Server::Request, *, required: Array[String] = ["(request-target)", "host", "date"],
+public def verify(request: HTTP::Server::Request, *, body: Bytes? = nil,
+                  required: Array[String] = ["(request-target)", "host", "date"],
                   max_skew: Duration = 5.minutes, max_body_bytes: Int? = nil, require_digest: Bool = true,
                   now: Time = Time.now, &key: (String) -> Crypto::RSA::PublicKey?) -> Verified
-  params = Verify.params(Verify.signature_text(request.headers))
+  signed = verify_signature(request.method, request.target, request.headers, required: required,
+                            max_skew: max_skew, now: now, &key)
+  read = body || request.body.read_bytes(max: max_body_bytes)
+  if signed.headers.include?("digest")
+    digest = request.headers.all("digest").join(", ")
+    raise DigestMismatch.new("the body does not match its Digest header") unless Digest.matches?(digest, read)
+  elsif require_digest && !read.empty?
+    raise DigestMismatch.new("the signature covers no Digest header for the body")
+  end
+  Verified.new(key_id: signed.key_id, algorithm: signed.algorithm, headers: signed.headers, body: read)
+end
+
+# Verifies the signature of a request alone, from its method, its target
+# as sent (path and query) and its headers: what [HTTPSignatures.verify]
+# checks but the body, which is neither read nor compared with its
+# Digest. For a request whose body is checked apart
+# ([HTTPSignatures::Digest.matches?] against the covered Digest, when
+# `headers` of the result includes `digest`), or verified elsewhere than
+# in a server's handler.
+#
+# ```quarz no_run
+# keys: Hash[String, Crypto::RSA::PublicKey] = {}   # keyId => key
+# handler = HTTP.handler do |req|
+#   s = HTTPSignatures.verify_signature(req.method, req.target, req.headers) { |key_id| keys[key_id]? }
+#   HTTP::Server::Response.text("signed by #{s.key_id}")
+# end
+# ```
+#
+# ## Raises
+#
+# As `verify`, but [DigestMismatch]: [MissingSignature],
+# [MalformedSignature], [UnsupportedAlgorithm], [MissingHeader],
+# [Expired], [UnknownKey] or [BadSignature].
+public def verify_signature(method: String, target: String, headers: HTTP::Headers, *,
+                            required: Array[String] = ["(request-target)", "host", "date"],
+                            max_skew: Duration = 5.minutes, now: Time = Time.now,
+                            &key: (String) -> Crypto::RSA::PublicKey?) -> Signed
+  params = Verify.params(Verify.signature_text(headers))
   key_id = params["keyid"]? || raise(MalformedSignature.new("the signature has no keyId"))
   sig_text = params["signature"]? || raise(MalformedSignature.new("the signature has no signature parameter"))
   algorithm = (params["algorithm"]? || "hs2019").downcase
@@ -86,8 +178,8 @@ public def verify(request: HTTP::Server::Request, *, required: Array[String] = [
   end
   created = params["created"]?
   expires = params["expires"]?
-  Verify.check_times(request.headers, covered, created, expires, max_skew, now)
-  text = signing_string(request.method, request.target, request.headers, covered, created: created, expires: expires)
+  Verify.check_times(headers, covered, created, expires, max_skew, now)
+  text = signing_string(method, target, headers, covered, created: created, expires: expires)
   signature = begin
     Base64.decode(sig_text)
   rescue ArgumentError
@@ -97,14 +189,7 @@ public def verify(request: HTTP::Server::Request, *, required: Array[String] = [
   raise UnknownKey.new("no key for the signature's keyId") if public_key.nil?
   ok = Verify.signed?(public_key, text, signature, algorithm)
   raise BadSignature.new("the signature does not verify with the key") unless ok
-  body = request.body.read_bytes(max: max_body_bytes)
-  if covered.include?("digest")
-    digest = request.headers.all("digest").join(", ")
-    raise DigestMismatch.new("the body does not match its Digest header") unless Digest.matches?(digest, body)
-  elsif require_digest && !body.empty?
-    raise DigestMismatch.new("the signature covers no Digest header for the body")
-  end
-  Verified.new(key_id: key_id, algorithm: algorithm, headers: covered, body: body)
+  Signed.new(key_id: key_id, algorithm: algorithm, headers: covered)
 end
 
 # :nodoc:

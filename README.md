@@ -71,6 +71,18 @@ The block is given the peer's `keyId` before anything is verified: a
 block that fetches a key by it must check it first (a URL to fetch is a
 request the peer chose).
 
+An application that reads the body itself first (its own limit, a key
+found from the body, the body of a request that fails kept) gives it:
+`verify(req, body: bytes) { ... }` reads nothing and checks the [Digest]
+against `bytes`. `verify_signature(req.method, req.target, req.headers)
+{ ... }` verifies the signature alone and gives a `Signed` (`key_id`,
+`algorithm`, `headers`), for the body checked apart
+(`HTTPSignatures::Digest.matches?`).
+
+The body is read only once the signature has verified: after
+`BadSignature`, a second `verify` of the same request with a refreshed
+key (a peer that rotated its key) works.
+
 ## What is supported
 
 - Keys: RSA ([Crypto::RSA]). `rsa-sha256` is RSASSA-PKCS1-v1_5 with

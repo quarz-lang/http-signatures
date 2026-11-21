@@ -296,6 +296,71 @@ class VerifyTest < Test::Case
     assert(v.body.empty?)
   end
 
+  # #10: a body the application read first, given as `body:`: nothing
+  # is read, the Digest is checked against it.
+  def test_a_body_read_first
+    covered = ["(request-target)", "host", "date", "digest"]
+    req = request(headers({"Signature" => signed(covered)}))
+    body = req.body.read_bytes
+    v = HTTPSignatures.verify(req, body: body, now: now) { |id| lookup(id) }
+    assert_equal(BODY.to_bytes, v.body)
+    assert_equal(covered, v.headers)
+    # Given as it is, not read again: the request's body stays read.
+    req = request(headers({"Signature" => signed(covered)}))
+    v = HTTPSignatures.verify(req, body: BODY.to_bytes, now: now) { |id| lookup(id) }
+    assert_equal(BODY.to_bytes, req.body.read_bytes)
+    # Another body than the Digest's.
+    e = assert_raise(HTTPSignatures::DigestMismatch) do
+      HTTPSignatures.verify(request(headers({"Signature" => signed(covered)})), body: b"other", now: now) { |id| lookup(id) }
+      nil
+    end
+    assert_equal("the body does not match its Digest header", e.message)
+    # No Digest covered: refused for a body, unless asked not to.
+    plain = signed(["(request-target)", "host", "date"])
+    assert_raise(HTTPSignatures::DigestMismatch) do
+      HTTPSignatures.verify(request(headers({"Signature" => plain})), body: b"x", now: now) { |id| lookup(id) }
+      nil
+    end
+    v = HTTPSignatures.verify(request(headers({"Signature" => plain})), body: b"x", require_digest: false, now: now) { |id| lookup(id) }
+    assert_equal(b"x", v.body)
+  end
+
+  # #10: the signature alone, over the method, target and headers; the
+  # body is not read.
+  def test_the_signature_alone
+    covered = ["(request-target)", "host", "date", "digest"]
+    req = request(headers({"Signature" => signed(covered)}))
+    s = HTTPSignatures.verify_signature(req.method, req.target, req.headers, now: now) { |id| lookup(id) }
+    assert_equal(HTTPSignatures::Signed.new(key_id: "Test", algorithm: "rsa-sha256", headers: covered), s)
+    assert_equal(BODY.to_bytes, req.body.read_bytes)
+    assert_true(HTTPSignatures::Digest.matches?(req.headers["digest"] || "", BODY))
+    # A body that does not match is not its concern.
+    h = headers({"Signature" => signed(covered)})
+    assert_equal("Test", HTTPSignatures.verify_signature("POST", TARGET, h, now: now) { |id| lookup(id) }.key_id)
+    assert_raise(HTTPSignatures::BadSignature) do
+      HTTPSignatures.verify_signature("PUT", TARGET, h, now: now) { |id| lookup(id) }
+      nil
+    end
+    assert_raise(HTTPSignatures::MissingHeader) do
+      HTTPSignatures.verify_signature("POST", TARGET, h, required: ["x-other"], now: now) { |id| lookup(id) }
+      nil
+    end
+  end
+
+  # #10: after BadSignature (a key the peer has rotated away from), a
+  # second verify of the same request with a refreshed key: the body was
+  # not read by the first.
+  def test_another_key_after_bad_signature
+    req = request(headers({"Signature" => signed(["(request-target)", "host", "date", "digest"])}))
+    stale = Crypto::RSA::PrivateKey.generate(2048).public_key
+    assert_raise(HTTPSignatures::BadSignature) do
+      HTTPSignatures.verify(req, now: now) { |_| stale }
+      nil
+    end
+    v = HTTPSignatures.verify(req, now: now) { |id| lookup(id) }
+    assert_equal(BODY.to_bytes, v.body)
+  end
+
   # Every error is an HTTPSignatures::Error.
   def test_one_root
     errors: Array[HTTPSignatures::Error] = [
