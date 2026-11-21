@@ -152,9 +152,11 @@ end
 #
 # An [HTTPSignatures::Error] saying why: [MissingSignature],
 # [MalformedSignature], [UnsupportedAlgorithm], [MissingHeader],
-# [Expired], [UnknownKey], [BadSignature] or [DigestMismatch]. Reading the
+# [Expired], [UnknownKey], [BadSignature] or [DigestMismatch], whatever
+# the peer sent (a Date or a `created` centuries away is [Expired], an
+# `expires` past what a [Time] holds has not passed). Reading the
 # body raises as [HTTP::Body#read_bytes] does ([HTTP::PayloadTooLarge] past the
-# limit).
+# limit), and what the block raises passes through as it is.
 public def verify(request: HTTP::Server::Request, *, body: Bytes? = nil,
                   required: Array[String] = ["(request-target)", "host", "date"],
                   max_skew: Duration = 5.minutes, max_body_bytes: Int? = nil, require_digest: Bool = true,
@@ -231,6 +233,11 @@ end
 module Verify
   # At most this many covered names.
   MAX_COVERED = 32
+
+  # A `created` or `expires` of this many seconds or more is past what a
+  # [Time] holds (2262-04-11, `Time.at(9_223_372_036)` the last whole
+  # second it takes): beyond any `max_skew` in the future.
+  LAST_SECOND = 9_223_372_036
 
   # Whether `signature` is the key's over `text`: RSASSA-PKCS1-v1_5 with
   # SHA-256, or for hs2019 also RSASSA-PSS with SHA-512. A signature the
@@ -348,36 +355,51 @@ module Verify
   # parse) unless the signature is valid at `now`.
   def self.check_times(headers: HTTP::Headers, covered: Array[String], created: String?, expires: String?,
                        max_skew: Duration, now: Time, lenient: Bool = false) -> Void
+    # (Times are compared with `now - max_skew` and `now + max_skew`, never
+    # by a difference, which overflows for one centuries away; a value
+    # outside the range a [Time] holds is decided by its side.)
+    earliest = now - max_skew
+    latest = now + max_skew
     if covered.include?("date")
       # (The Date that is checked is the one that is signed.)
       dates = headers.all("date")
       raise MalformedSignature.new("the request has more than one Date header") if dates.size > 1
       text = dates[0]?
-      date = text ? Time.httpdate?(text) : nil
-      raise MalformedSignature.new("the Date header is not an HTTP date") if text && date.nil?
-      if date && (date - now > max_skew || now - date > max_skew)
-        raise Expired.new("the Date header is more than #{max_skew} from now")
+      if text
+        date = begin
+          Time.httpdate(text)
+        rescue ArgumentError
+          raise MalformedSignature.new("the Date header is not an HTTP date")
+        rescue RangeError
+          # (A year a Time cannot hold: centuries from now, either way.)
+          raise Expired.new("the Date header is more than #{max_skew} from now")
+        end
+        if date < earliest || date > latest
+          raise Expired.new("the Date header is more than #{max_skew} from now")
+        end
       end
     end
-    # (At most 12 digits, 9 of fraction: no number that `Time.at` cannot
-    # take reaches it.)
     if expires && !expires.match?(/\A[0-9]{1,12}(\.[0-9]{1,9})?\z/)
       raise MalformedSignature.new("expires is not a number")
     end
-    # (Passed is passed: the signer's deadline gets no allowance.)
-    if expires && now > Time.at(expires.to_f)
+    # (Passed is passed: the signer's deadline gets no allowance. One past
+    # what a Time holds, year 2262, has not passed.)
+    if expires && expires.partition(".")[0].to_i < Verify::LAST_SECOND && now > Time.at(expires.to_f)
       raise Expired.new("the signature has expired")
     end
     if created
       # (`lenient`: a fraction, dropped.)
       form = lenient ? /\A[0-9]{1,12}(\.[0-9]{1,9})?\z/ : /\A[0-9]{1,12}\z/
       raise MalformedSignature.new("created is not an integer") unless created.match?(form)
-      created_at = Time.at(created.partition(".")[0].to_i)
-      raise Expired.new("the signature was created in the future") if created_at - now > max_skew
+      seconds = created.partition(".")[0].to_i
+      # (Past what a Time holds is in the future.)
+      if seconds >= Verify::LAST_SECOND || Time.at(seconds) > latest
+        raise Expired.new("the signature was created in the future")
+      end
       # Older than the window: refused when the signature covers it,
       # whatever `expires` says. One it does not cover protects nothing:
       # only the future is refused, as a parameter that makes no sense.
-      if covered.include?("(created)") && now - created_at > max_skew
+      if covered.include?("(created)") && Time.at(seconds) < earliest
         raise Expired.new("the signature was created too long ago")
       end
     end
