@@ -26,6 +26,10 @@ class DigestTest < Test::Case
     assert(!HTTPSignatures::Digest.matches?("SHA-256", BODY))
     assert(!HTTPSignatures::Digest.matches?("SHA-256=not base64!", BODY))
     assert(!HTTPSignatures::Digest.matches?("", BODY))
+    # #20: only spaces and tabs are trimmed around an entry and its parts.
+    assert(HTTPSignatures::Digest.matches?("\tSHA-256=#{VALUE}\t", BODY))
+    assert(!HTTPSignatures::Digest.matches?("\u2003SHA-256=#{VALUE}", BODY))
+    assert(!HTTPSignatures::Digest.matches?("SHA-256=#{VALUE}\u3000", BODY))
   end
 
   # A value of another length never matches (`Crypto.secure_compare` is

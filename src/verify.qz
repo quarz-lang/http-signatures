@@ -257,7 +257,7 @@ module Verify
     return values[0] if values.size == 1
     auth = headers["authorization"]
     if auth
-      scheme, _, rest = auth.strip.partition(" ")
+      scheme, _, rest = trim_ows(auth).partition(" ")
       return rest if scheme.downcase == "signature"
     end
     raise MissingSignature.new("the request has no Signature header")
@@ -311,7 +311,7 @@ module Verify
       elsif lenient
         start = i
         i += 1 while i < chars.size && chars[i] != ","
-        value << chars[start...i].join.strip
+        value << trim_ows(chars[start...i].join)
       else
         while i < chars.size && chars[i] != "," && chars[i] != " " && chars[i] != "\t"
           value << chars[i]
