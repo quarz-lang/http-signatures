@@ -31,6 +31,14 @@ class SigningStringTest < Test::Case
                                                expires: "1402170699.5"))
   end
 
+  # #20: values are trimmed of spaces and tabs only: other whitespace is
+  # part of the value, signed and verified as written.
+  def test_other_whitespace_kept
+    headers = HTTP::Headers.empty.add("Host", "example.com\u00a0").add("X-B", "\u3000b\u2003")
+    assert_equal("host: example.com\u00a0\nx-b: \u3000b\u2003",
+                 HTTPSignatures.signing_string("GET", "/", headers, ["host", "x-b"]))
+  end
+
   def test_errors
     headers = HTTP::Headers.of({"Host" => "example.com"})
     e = assert_raise(HTTPSignatures::MissingHeader) { HTTPSignatures.signing_string("GET", "/", headers, ["host", "date"]); nil }

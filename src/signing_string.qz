@@ -44,7 +44,7 @@ public def signing_string(method: String, target: String, headers: HTTP::Headers
             else
               values = headers.all(name)
               raise MissingHeader.new("the request has no #{name} header") if values.empty?
-              values.map { |v| v.strip }.join(", ")
+              values.map { |v| trim_ows(v) }.join(", ")
             end
     "#{name}: #{value}"
   end
@@ -54,3 +54,13 @@ end
 # :nodoc:
 # An HTTP field name: one or more token characters (RFC 9110 §5.6.2).
 FIELD_NAME = /\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\z/
+
+# :nodoc:
+# `text` without the spaces and tabs around it: HTTP's optional
+# whitespace (RFC 9110 §5.6.3), and no other. A value with other
+# whitespace (U+00A0, U+3000) is signed and verified as it is written
+# (#20), as quarz's HTTP parser now reads it (quarz-lang/quarz#1126).
+def trim_ows(text: String) -> String
+  return text unless text.match?(/\A[ \t]|[ \t]\z/)
+  text.sub(/\A[ \t]+/, "").sub(/[ \t]+\z/, "")
+end

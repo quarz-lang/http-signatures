@@ -22,10 +22,10 @@ module Digest
   # regard to case.
   def self.sha256(header: String) -> Bytes?
     header.split(",").each do |entry|
-      name, eq, value = entry.strip.partition("=")
-      next if eq.empty? || name.strip.downcase != "sha-256"
+      name, eq, value = trim_ows(entry).partition("=")
+      next if eq.empty? || trim_ows(name).downcase != "sha-256"
       return begin
-        Base64.decode(value.strip)
+        Base64.decode(trim_ows(value))
       rescue ArgumentError
         nil
       end
