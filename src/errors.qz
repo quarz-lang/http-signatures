@@ -44,3 +44,9 @@ end
 # The signature does not verify with the key.
 class BadSignature < Error
 end
+
+# The request's Host is not one of the names given as `hosts:` to
+# [HTTPSignatures.verify]: a request signed for another server, sent
+# again to this one (#18).
+class WrongHost < Error
+end

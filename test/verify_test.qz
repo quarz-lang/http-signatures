@@ -47,6 +47,38 @@ class VerifyTest < Test::Case
     "#{params},headers=\"#{covered.join(" ")}\",signature=\"#{Base64.encode(sig)}\""
   end
 
+  # #18: with `hosts:`, the covered Host must be one of them, as host
+  # names; without, any Host verifies.
+  def test_hosts
+    covered = ["(request-target)", "host", "date", "digest"]
+    req = request(headers({"Signature" => signed(covered)}))
+    check = ->(hosts: Array[String]?) {
+      begin
+        HTTPSignatures.verify(req, body: BODY.to_bytes, now: now, hosts: hosts) { |id| lookup(id) }
+        "ok"
+      rescue HTTPSignatures::Error => e
+        "#{e.class.name}: #{e.message}"
+      end
+    }
+    assert_equal("ok", check.call(nil))
+    assert_equal("ok", check.call(["example.com"]))
+    assert_equal("ok", check.call(["other.example", "EXAMPLE.com:443"]))
+    assert_equal("HTTPSignatures::WrongHost: the request's Host is not one of hosts:", check.call(["other.example"]))
+    assert_equal("HTTPSignatures::WrongHost: the request's Host is not one of hosts:", check.call(["example.com:8443"]))
+    # A signature that does not cover host: refused when hosts: is given.
+    uncovered = request(headers({"Signature" => signed(["(request-target)", "date", "digest"])}))
+    e = assert_raise(HTTPSignatures::MissingHeader) do
+      HTTPSignatures.verify(uncovered, body: BODY.to_bytes, now: now, required: ["date"], hosts: ["example.com"]) { |id| lookup(id) }
+      nil
+    end
+    assert_equal("the signature does not cover host", e.message)
+    # verify_signature takes it too.
+    assert_raise(HTTPSignatures::WrongHost) do
+      HTTPSignatures.verify_signature("POST", TARGET, req.headers, now: now, hosts: ["b.example"]) { |id| lookup(id) }
+      nil
+    end
+  end
+
   # C.1, its Authorization form: `date` by default for rsa-sha256.
   def test_appendix_c_default
     sig = "keyId=\"Test\",algorithm=\"rsa-sha256\",signature=\"SjWJWbWN7i0wzBvtPl8rbASWz5xQW6mcJmn+ibttBqtifLN7Sazz6m79cNfwwb8DMJ5cou1s7uEGKKCs+FLEEaDV5lp7q25WqS+lavg7T8hc0GppauB6hbgEKTwblDHYGEtbGmtdHgVCk9SuS13F0hZ8FD0k/5OxEPXe5WozsbM=\""

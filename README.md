@@ -49,7 +49,7 @@ covering `(created)` or `(expires)` needs hs2019.
 ```crystal
 handler = HTTP.handler do |req|
   begin
-    v = HTTPSignatures.verify(req) { |key_id| key_for(key_id) }   # a Crypto::RSA::PublicKey or nil
+    v = HTTPSignatures.verify(req, hosts: ["social.example"]) { |key_id| key_for(key_id) }   # a Crypto::RSA::PublicKey or nil
     HTTP::Server::Response.text("hello #{v.key_id}")              # v.body: the body, read and checked
   rescue HTTPSignatures::Error => e
     HTTP::Server::Response.text(e.message, 401)
@@ -62,7 +62,10 @@ end
 `required:` names (by default `(request-target) host date`) are covered,
 the time (a covered [Date] and a covered `created` within `max_skew:`,
 five minutes, either way; `expires` not passed, with no allowance),
-the signature with the key the block gives, and then the body against
+the request's `Host` against `hosts:` when given (the names this server
+answers to: without it, a request signed for another server with the
+same path verifies here too, so give it), the signature with the key
+the block gives, and then the body against
 the covered [Digest] (a body no [Digest] covers is refused unless
 `require_digest: false`). Each failure raises a subclass of
 [HTTPSignatures::Error] whose message says why and quotes nothing the
