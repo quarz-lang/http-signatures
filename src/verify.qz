@@ -85,6 +85,17 @@ end
 #   is covered, compared with that Digest (`require_digest: false`
 #   accepts a body no Digest covers).
 #
+# What is not checked unless asked: that the request was signed for this
+# server. A signed request one server received can be sent again, within
+# `max_skew`, to another whose path is the same (`/inbox`), with its
+# `Host` as signed. Give the names this server answers to as `hosts:`
+# (`["social.example"]`): the request's `Host`, which the signature must
+# then cover, has to be one of them, compared as host names (case aside,
+# `:443` and `:80` the same as no port), or [WrongHost] is raised. Behind
+# a proxy that rewrites `Host`, give the name the proxy forwards;
+# `X-Forwarded-Host` is not read, since the signature does not cover it
+# (#18).
+#
 # ## Forms deployed signers send: `lenient: true`
 #
 # Off by default. With `lenient: true`, these forms of the parameters,
@@ -152,7 +163,7 @@ end
 #
 # An [HTTPSignatures::Error] saying why: [MissingSignature],
 # [MalformedSignature], [UnsupportedAlgorithm], [MissingHeader],
-# [Expired], [UnknownKey], [BadSignature] or [DigestMismatch], whatever
+# [Expired], [UnknownKey], [BadSignature], [WrongHost] or [DigestMismatch], whatever
 # the peer sent (a Date or a `created` centuries away is [Expired], an
 # `expires` past what a [Time] holds has not passed). Reading the
 # body raises as [HTTP::Body#read_bytes] does ([HTTP::PayloadTooLarge] past the
@@ -160,10 +171,10 @@ end
 public def verify(request: HTTP::Server::Request, *, body: Bytes? = nil,
                   required: Array[String] = ["(request-target)", "host", "date"],
                   max_skew: Duration = 5.minutes, max_body_bytes: Int? = nil, require_digest: Bool = true,
-                  now: Time = Time.now, lenient: Bool = false,
+                  now: Time = Time.now, lenient: Bool = false, hosts: Array[String]? = nil,
                   &key: (String) -> Crypto::RSA::PublicKey?) -> Verified
   signed = verify_signature(request.method, request.target, request.headers, required: required,
-                            max_skew: max_skew, now: now, lenient: lenient, &key)
+                            max_skew: max_skew, now: now, lenient: lenient, hosts: hosts, &key)
   read = body || request.body.read_bytes(max: max_body_bytes)
   if signed.headers.include?("digest")
     digest = request.headers.all("digest").join(", ")
@@ -194,10 +205,11 @@ end
 #
 # As `verify`, but [DigestMismatch]: [MissingSignature],
 # [MalformedSignature], [UnsupportedAlgorithm], [MissingHeader],
-# [Expired], [UnknownKey] or [BadSignature].
+# [Expired], [UnknownKey], [BadSignature] or [WrongHost].
 public def verify_signature(method: String, target: String, headers: HTTP::Headers, *,
                             required: Array[String] = ["(request-target)", "host", "date"],
                             max_skew: Duration = 5.minutes, now: Time = Time.now, lenient: Bool = false,
+                            hosts: Array[String]? = nil,
                             &key: (String) -> Crypto::RSA::PublicKey?) -> Signed
   params = Verify.params(Verify.signature_text(headers), lenient)
   key_id = params["keyid"]? || raise(MalformedSignature.new("the signature has no keyId"))
@@ -209,6 +221,10 @@ public def verify_signature(method: String, target: String, headers: HTTP::Heade
   covered = Verify.covered(params["headers"]?, algorithm, lenient)
   required.each do |name|
     raise MissingHeader.new("the signature does not cover #{name.downcase}") unless covered.include?(name.downcase)
+  end
+  if (names = hosts)
+    raise MissingHeader.new("the signature does not cover host") unless covered.include?("host")
+    Verify.check_host(headers, names)
   end
   created = params["created"]?
   expires = params["expires"]?
@@ -247,6 +263,24 @@ module Verify
     key.verify(text, signature, :sha256) || (algorithm == "hs2019" && key.verify_pss(text, signature, :sha512))
   rescue Crypto::Error
     false
+  end
+
+  # Raises [WrongHost] unless the request has one Host header and it is
+  # one of `names`, compared as host names: case aside, and a default
+  # port (`:443`, `:80`) the same as none (#18).
+  def self.check_host(headers: HTTP::Headers, names: Array[String]) -> Void
+    given = headers.all("host")
+    host = given.size == 1 ? Verify.host_name(given[0]) : nil
+    unless host && names.any? { |n| Verify.host_name(n) == host }
+      raise WrongHost.new("the request's Host is not one of hosts:")
+    end
+  end
+
+  # :nodoc:
+  # A host as compared: lower case, without a default port.
+  def self.host_name(text: String) -> String
+    h = text.downcase
+    h.delete_suffix(":443").delete_suffix(":80")
   end
 
   # The parameters' text: the Signature header's, or the Authorization
