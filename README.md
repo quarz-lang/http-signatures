@@ -57,6 +57,9 @@ handler = HTTP.handler do |req|
 end
 ```
 
+(The example answers with each message; see "What verify does not check" for
+what that tells a peer, and for four things the program verifying must do.)
+
 `verify` checks, in order: the parameters (from `Signature`, or
 `Authorization: Signature`), the algorithm, the covered names, that
 `required:` names (by default `(request-target) host date`) are covered,
@@ -98,6 +101,43 @@ against `bytes`. `verify_signature(req.method, req.target, req.headers)
 The body is read only once the signature has verified: after
 `BadSignature`, a second `verify` of the same request with a refreshed
 key (a peer that rotated its key) works.
+
+## What verify does not check
+
+A signature that verifies says the holder of the key signed these
+headers. Four things are left to the program that verifies:
+
+- **The key's size.** `verify` takes whatever RSA key the block gives, of
+  any modulus size. Give only keys that are large enough (2048 bits at
+  least), and refuse the others when you store them.
+- **Whose key it is.** The key named by `keyId` is the one the block
+  returned for it; nothing ties it to the party the message claims to
+  come from (an `actor` in the body, a `From` header). Check that the
+  key belongs to that party (by the document that publishes it, for
+  instance) before trusting the claim.
+- **Replay.** A signed request verifies again as long as its time is
+  inside the window (five minutes either way by default, `max_skew:`):
+  an eavesdropper who has it can send it again. For an operation that
+  must happen once, keep what the request is identified by (its
+  `Digest`, or an id in the body) for the length of the window and
+  refuse a second one, or narrow `max_skew:`.
+- **What the answer tells.** The messages of `UnknownKey` and
+  `BadSignature` differ, so a peer that sees them can tell which key ids
+  the server knows. Answer both alike (and log the difference):
+
+```crystal
+handler = HTTP.handler do |req|
+  begin
+    v = HTTPSignatures.verify(req, hosts: ["social.example"]) { |key_id| key_for(key_id) }
+    HTTP::Server::Response.text("hello #{v.key_id}")
+  rescue HTTPSignatures::UnknownKey, HTTPSignatures::BadSignature => e
+    STDERR.puts("signature refused: #{e.message}")             # the reason stays here
+    HTTP::Server::Response.text("signature refused", 401)   # the same for both
+  rescue HTTPSignatures::Error => e
+    HTTP::Server::Response.text(e.message, 401)
+  end
+end
+```
 
 ## What is supported
 
